@@ -25,6 +25,17 @@ data = yaml.load(open(configuration.SPIRE_DATA, "r"))
 
 word_finder = re.compile(r"\[\[.+?\]\]")
 
+# --- URL helpers ---
+
+STS1_WIKI = "http://slay-the-spire.wikia.com/wiki"
+STS2_WIKI = "https://sts2.untapped.gg/en"
+
+def wiki_url(title, game="STS1"):
+  if game == "STS2":
+    slug = re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')
+    return "{0}/cards/{1}".format(STS2_WIKI, slug)
+  return "{0}/{1}".format(STS1_WIKI, url_encode(title))
+
 def escape(string):
   return re.sub(r"\W", "", string.replace("(BETA)", "").lower())
 
@@ -60,15 +71,20 @@ def levenshtein(a, b):
         ])
   return matrix[len(b)][len(a)]
 
-def wiki_url(title):
-  return "http://slay-the-spire.wikia.com/wiki/{0}".format(url_encode(title))
+# --- Formatting ---
+
+def game_tag(item):
+  """Return a game tag string like '(STS1)' or '(STS2)'."""
+  return "({0})".format(item.get("game", "STS1"))
 
 def format_relic(relic_dict):
-  return """[{name:s}]({url:s}) {title:s}
+  game = relic_dict.get("game", "STS1")
+  return """[{name:s}]({url:s}) {tag:s} {title:s}
 
 {description:s}""".format(
     name = relic_dict["name"],
-    url = wiki_url(relic_dict["name"]),
+    url = wiki_url(relic_dict["name"], game),
+    tag = game_tag(relic_dict),
     title = "{0} Relic".format(
       relic_dict["category"]
     ),
@@ -80,11 +96,13 @@ def format_relic(relic_dict):
   )
 
 def format_potion(potion_dict):
-  return """[{name:s}]({url:s}) {title:s}
+  game = potion_dict.get("game", "STS1")
+  return """[{name:s}]({url:s}) {tag:s} {title:s}
 
 {description:s}""".format(
     name = potion_dict["name"],
-    url = wiki_url(potion_dict["name"]),
+    url = wiki_url(potion_dict["name"], game),
+    tag = game_tag(potion_dict),
     title = "{0} Potion".format(
       potion_dict["rarity"]
     ),
@@ -96,11 +114,13 @@ def format_potion(potion_dict):
   )
 
 def format_event(event_dict):
-  return """[{name:s}]({url:s}) {title:s}
+  game = event_dict.get("game", "STS1")
+  return """[{name:s}]({url:s}) {tag:s} {title:s}
 
 {description:s}""".format(
     name = event_dict["name"],
-    url = wiki_url(event_dict["name"]),
+    url = wiki_url(event_dict["name"], game),
+    tag = game_tag(event_dict),
     title = "Event - {0}".format(
       event_dict["act"]
     ),
@@ -112,6 +132,7 @@ def format_event(event_dict):
   )
 
 def format_card(card_dict):
+  game = card_dict.get("game", "STS1")
   category = card_dict["category"]
   def format_card_title():
     if category in ["Curse", "Status"]:
@@ -121,14 +142,15 @@ def format_card(card_dict):
     else:
       return "{category:s} {rarity:s} {type:s}".format(
         category = category,
-        rarity = card_dict["rarity"],
-        type = card_dict["card_type"]
+        rarity = card_dict["rarity"] or "?",
+        type = card_dict["card_type"] or "?"
       )
-  return """[{name:s}]({url:s}) {title:s}
+  return """[{name:s}]({url:s}) {tag:s} {title:s}
 
 {cost:s} | {description:s}""".format(
     name = card_dict["name"],
-    url = wiki_url(card_dict["name"]),
+    url = wiki_url(card_dict["name"], game),
+    tag = game_tag(card_dict),
     title = format_card_title(),
     cost = "Unplayable" if card_dict["cost"] is None else "{0} Energy".format(card_dict["cost"]),
     description = replace_energy(
@@ -187,7 +209,15 @@ def highlight_key_words(string):
     "stance",
     "stances",
     "retain",
-    "retained"
+    "retained",
+    # STS2 keywords
+    "vigor",
+    "enchant",
+    "swift",
+    "summon",
+    "conjure",
+    "decree",
+    "soot",
   ]
 
   return " ".join([
@@ -201,20 +231,41 @@ def replace_energy(string):
   return string.replace("[G]", "[E]").replace("[W]", "[E]").replace("[R]", "◼").replace("[B]", "◼").replace("[E]", "[E]")
 
 def find_by_title(title, minimum_likeness = 0.85):
-  title = escape(title)
-  items = [
+  """Find all matching items across both games.
+  
+  Returns a list of matching items. If the same name appears in both
+  STS1 and STS2, both are returned.
+  """
+  title_escaped = escape(title)
+
+  # Score all items
+  scored = [
     (
       item,
-      distance.get_jaro_distance(escape(item["name"]), title, winkler = True, scaling = 0.1)
+      distance.get_jaro_distance(escape(item["name"]), title_escaped, winkler = True, scaling = 0.1)
     )
     for item in data
   ]
-  items.sort(key = lambda item: item[1])
-  items.reverse()
-  if minimum_likeness is not None:
-    if items[0][1] < minimum_likeness:
-      return None
-  return items[0][0]
+  scored.sort(key = lambda item: item[1], reverse=True)
+
+  if not scored or scored[0][1] < minimum_likeness:
+    return []
+
+  best_score = scored[0][1]
+  best_name = escape(scored[0][0]["name"])
+
+  # Collect all items with the same name (could be in both STS1 and STS2)
+  results = []
+  for item, score in scored:
+    if escape(item["name"]) == best_name:
+      results.append(item)
+    elif score >= minimum_likeness and abs(score - best_score) < 0.01:
+      # Also include very close matches (e.g. slightly different names)
+      results.append(item)
+    else:
+      break
+
+  return results
 
 def search_text(text):
   return [
@@ -223,16 +274,19 @@ def search_text(text):
   ]
 
 def format_comment(text):
-  results = [
+  search_results = [
     find_by_title(word)
     for word in search_text(text)
   ]
-  
-  result_lines = [
-    format_item(result).splitlines()
-    for result in results
-    if result is not None
-  ]
+
+  result_lines = []
+  for items in search_results:
+    if not items:
+      continue
+    for item in items:
+      formatted = format_item(item)
+      if formatted:
+        result_lines.append(formatted.splitlines())
 
   return "\r\n".join([
     "\r\n".join(
@@ -266,7 +320,7 @@ def main(conn = None, logger = None):
         conn.send("comment_replied")
       return """{0}
 
-    ^Call ^me ^with ^up ^to ^10 ^([[ name ]].) ^Data ^accurate ^as ^of ^({1}.) ^Some ^legacy ^cards ^with ^new ^beta ^effects ^might ^not ^be ^shown ^correctly. ^[Questions?](https://www.reddit.com/message/compose/?to=ehmohteeoh&subject=SpireScan%20Inquiry)""".format(reply, data_date)
+    ^Call ^me ^with ^up ^to ^10 ^([[ name ]].) ^Data ^accurate ^as ^of ^({1}.) ^[Questions?](https://www.reddit.com/message/compose/?to=ehmohteeoh&subject=SpireScan%20Inquiry)""".format(reply, data_date)
 
   try:
     with RedditCrawler(
