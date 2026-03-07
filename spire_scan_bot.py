@@ -34,6 +34,7 @@ def wiki_url(title, game="STS1"):
   if game == "STS2":
     slug = re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')
     return "{0}/cards/{1}".format(STS2_WIKI, slug)
+  # STS1 and BOTH both link to the STS1 wiki
   return "{0}/{1}".format(STS1_WIKI, url_encode(title))
 
 def escape(string):
@@ -73,9 +74,24 @@ def levenshtein(a, b):
 
 # --- Formatting ---
 
-def game_tag(item):
-  """Return a game tag string like '(STS1)' or '(STS2)'."""
-  return "({0})".format(item.get("game", "STS1"))
+def game_tag(item_or_tag=None):
+  """Return a superscript game tag using bold serif roman numerals.
+
+  Accepts an item dict, a game string, or a pre-built tag string.
+  """
+  if isinstance(item_or_tag, dict):
+    game = item_or_tag.get("game", "STS1")
+  elif item_or_tag is not None:
+    game = item_or_tag
+  else:
+    game = "STS1"
+
+  if game == "BOTH":
+    return "^(\U0001d408, \U0001d408\U0001d408)"  # ^(𝐈, 𝐈𝐈)
+  elif game == "STS2":
+    return "^\U0001d408\U0001d408"  # ^𝐈𝐈
+  else:
+    return "^\U0001d408"  # ^𝐈
 
 def format_relic(relic_dict):
   game = relic_dict.get("game", "STS1")
@@ -302,6 +318,77 @@ def search_text(text):
     for word in word_finder.findall(text)
   ]
 
+def _normalize_rarity(r):
+  """Normalize rarity labels across games (STS1 'Starter' == STS2 'Basic')."""
+  if r in ("Starter", "Basic"):
+    return "Basic"
+  return r
+
+def _items_identical_for_display(a, b):
+  """Check if two items from different games are identical for display.
+
+  If so, we show them as a single entry with ^(𝐈, 𝐈𝐈) tag.
+  Name comparison is case-insensitive; Starter==Basic for rarity.
+  """
+  if a["type"] != b["type"]:
+    return False
+  if a["name"].lower() != b["name"].lower():
+    return False
+  if a["type"] == "Card":
+    return (a.get("description") == b.get("description") and
+            a.get("card_type") == b.get("card_type") and
+            a.get("category") == b.get("category") and
+            _normalize_rarity(a.get("rarity")) == _normalize_rarity(b.get("rarity")) and
+            a.get("cost") == b.get("cost") and
+            a.get("star_cost") == b.get("star_cost"))
+  elif a["type"] == "Relic":
+    return (a.get("description") == b.get("description") and
+            a.get("category") == b.get("category"))
+  elif a["type"] == "Potion":
+    return (a.get("description") == b.get("description") and
+            _normalize_rarity(a.get("rarity")) == _normalize_rarity(b.get("rarity")))
+  elif a["type"] == "Event":
+    return (a.get("description") == b.get("description") and
+            a.get("act") == b.get("act"))
+  return False
+
+def _deduplicate_results(items):
+  """Deduplicate items that are identical across STS1 and STS2.
+
+  Returns a list of items where identical cross-game pairs are merged
+  into a single item with game="BOTH".
+  """
+  if len(items) < 2:
+    return items
+
+  sts1 = [i for i in items if i.get("game") == "STS1"]
+  sts2 = [i for i in items if i.get("game") == "STS2"]
+  other = [i for i in items if i.get("game") not in ("STS1", "STS2")]
+
+  merged = []
+  used_sts2 = set()
+
+  for item1 in sts1:
+    found_match = False
+    for j, item2 in enumerate(sts2):
+      if j not in used_sts2 and _items_identical_for_display(item1, item2):
+        # Merge: use STS2 item data (more modern labels) but mark as BOTH
+        combined = dict(item2)
+        combined["game"] = "BOTH"
+        merged.append(combined)
+        used_sts2.add(j)
+        found_match = True
+        break
+    if not found_match:
+      merged.append(item1)
+
+  for j, item2 in enumerate(sts2):
+    if j not in used_sts2:
+      merged.append(item2)
+
+  merged.extend(other)
+  return merged
+
 def format_comment(text):
   search_results = [
     find_by_title(word)
@@ -312,7 +399,8 @@ def format_comment(text):
   for items in search_results:
     if not items:
       continue
-    for item in items:
+    deduped = _deduplicate_results(items)
+    for item in deduped:
       formatted = format_item(item)
       if formatted:
         result_lines.append(formatted.splitlines())
