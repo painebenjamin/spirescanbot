@@ -8,8 +8,8 @@ import time
 import yaml
 from bs4 import BeautifulSoup
 
-# --- STS1 sources ---
-STS1_BASE = "https://slay-the-spire.fandom.com/wiki"
+# --- STS1 sources (MediaWiki API — Cloudflare blocks HTML scraping now) ---
+STS1_API = "https://slay-the-spire.fandom.com/api.php"
 
 # --- STS2 sources ---
 STS2_BASE = "https://sts2.untapped.gg"
@@ -57,25 +57,157 @@ class Event(SpireObject):
 
 
 # =========================================================================
-# STS1 Gathering (unchanged from original)
+# Wikitext parsing helpers
 # =========================================================================
 
-def Soup(url):
-  return BeautifulSoup(requests.get(url).text, "html.parser")
+def _clean_wikitext(text):
+  """Strip wikitext markup to plain text."""
+  # Remove {{KW|...}} and {{C|...}} templates → just the first arg
+  text = re.sub(r'\{\{KW\|([^}|]+)(?:\|[^}]*)?\}\}', r'\1', text)
+  text = re.sub(r'\{\{C\|([^}|]+)(?:\|[^}]*)?\}\}', r'\1', text)
+  # Remove other templates
+  text = re.sub(r'\{\{[^}]*\}\}', '', text)
+  # Remove [[File:...]] 
+  text = re.sub(r'\[\[File:[^\]]*\]\]', '', text)
+  # Convert [[Page|Display]] → Display, [[Page]] → Page
+  text = re.sub(r'\[\[([^]|]*)\|([^\]]*)\]\]', r'\2', text)
+  text = re.sub(r'\[\[([^\]]*)\]\]', r'\1', text)
+  # Remove bold/italic markup
+  text = re.sub(r"'{2,5}", '', text)
+  # Remove any remaining HTML tags
+  text = re.sub(r'<[^>]+>', '', text)
+  # Clean up whitespace
+  text = re.sub(r'\s+', ' ', text).strip()
+  return text
 
-def TableRows(url):
-  soup = Soup(url)
-  table = soup.find("table")
-  for row in table.find_all("tr"):
-    yield [cell.text.strip() for cell in row.find_all("td")]
+def _get_wikitext(page):
+  """Fetch wikitext for a page from the Fandom MediaWiki API."""
+  resp = requests.get(STS1_API, params={
+    "action": "parse",
+    "page": page,
+    "prop": "wikitext",
+    "format": "json",
+  }, timeout=15)
+  resp.raise_for_status()
+  data = resp.json()
+  return data["parse"]["wikitext"]["*"]
+
+def _parse_wiki_table_rows(wikitext):
+  """Parse rows from a wikitext table.
+  
+  Yields lists of cell values (cleaned) for each row.
+  Rows start with |- and cells start with |.
+  """
+  in_table = False
+  current_row = []
+
+  for line in wikitext.split("\n"):
+    line = line.strip()
+    if line.startswith("{|"):
+      in_table = True
+      continue
+    if line.startswith("|}"):
+      if current_row:
+        yield current_row
+      in_table = False
+      current_row = []
+      continue
+    if not in_table:
+      continue
+    if line.startswith("!"):
+      continue  # Header row
+    if line.startswith("|-"):
+      if current_row:
+        yield current_row
+      current_row = []
+      continue
+    if line.startswith("|"):
+      cell = line[1:].strip()
+      current_row.append(_clean_wikitext(cell))
+
+  if current_row:
+    yield current_row
+
+
+# =========================================================================
+# STS1 Gathering (via MediaWiki API)
+# =========================================================================
+
+def GatherCards():
+  card_pages = {
+    "Ironclad": "Ironclad_Cards",
+    "Silent": "Silent_Cards",
+    "Defect": "Defect_Cards",
+    "Watcher": "Watcher_Cards_(BETA)",
+    "Colorless": "Colorless_Cards",
+    "Status": "Status",
+    "Curse": "Curse",
+  }
+
+  cards = []
+
+  for category, page in card_pages.items():
+    print("Gathering STS1 {0}".format(category))
+    try:
+      wikitext = _get_wikitext(page)
+    except Exception as e:
+      print("  Failed to fetch {0}: {1}".format(page, e))
+      continue
+
+    for row in _parse_wiki_table_rows(wikitext):
+      if category == "Status":
+        if len(row) >= 4:
+          name, _, card_type, description = row[0], row[1], row[2], row[3]
+          print("Found STS1 card {0}".format(name))
+          cards.append(Card(name, description, card_type, category, None, None, game="STS1"))
+
+      elif category == "Curse":
+        if len(row) >= 3:
+          name = row[0]
+          description = row[2] if len(row) >= 3 else row[-1]
+          print("Found STS1 card {0}".format(name))
+          cards.append(Card(name, description, "Curse", category, None, None, game="STS1"))
+
+      elif len(row) >= 6:
+        # Standard card: Name, Picture, Rarity, Type, Energy, Description
+        name, _, rarity, card_type, energy, description = row[0], row[1], row[2], row[3], row[4], row[5]
+        print("Found STS1 card {0}".format(name))
+        cards.append(Card(name, description, card_type, category, rarity, energy, game="STS1"))
+
+  return cards
+
+def GatherRelics():
+  relics = []
+  print("Gathering STS1 Relics")
+  try:
+    wikitext = _get_wikitext("Relics")
+  except Exception as e:
+    print("  Failed to fetch Relics: {0}".format(e))
+    return relics
+
+  for row in _parse_wiki_table_rows(wikitext):
+    if len(row) >= 4:
+      _, name, category, description = row[0], row[1], row[2], row[3]
+      print("Found STS1 relic {0}".format(name))
+      relics.append(Relic(name, description, category, game="STS1"))
+
+  return relics
 
 def GatherPotions():
   potions = []
-  for row in TableRows(STS1_BASE + "/Potions"):
-    if len(row) == 4:
-      _, name, rarity, description = row
+  print("Gathering STS1 Potions")
+  try:
+    wikitext = _get_wikitext("Potions")
+  except Exception as e:
+    print("  Failed to fetch Potions: {0}".format(e))
+    return potions
+
+  for row in _parse_wiki_table_rows(wikitext):
+    if len(row) >= 4:
+      _, name, rarity, description = row[0], row[1], row[2], row[3]
       print("Found STS1 potion {0}".format(name))
       potions.append(Potion(name, description, rarity, game="STS1"))
+
   return potions
 
 def GatherEvents():
@@ -87,85 +219,15 @@ def GatherEvents():
       events.append(Event(name, data[act][name], act, game="STS1"))
   return events
 
-def GatherRelics():
-  relics = []
-  for row in TableRows(STS1_BASE + "/Relics"):
-    if len(row) == 4:
-      _, name, category, description = row
-      print("Found STS1 relic {0}".format(name))
-      relics.append(Relic(name, description, category, game="STS1"))
-  return relics
-
-def GatherCards():
-  card_urls = {
-    "Ironclad": "/Ironclad_Cards",
-    "Silent": "/Silent_Cards",
-    "Defect": "/Defect_Cards",
-    "Watcher": "/Watcher_Cards_(BETA)",
-    "Colorless": "/Colorless_Cards",
-    "Status": "/Status",
-    "Curse": "/Curse"
-  }
-  
-  cards = []
-  
-  for category in card_urls:
-    print("Gathering STS1 {0}".format(category))
-    for row in TableRows(STS1_BASE + card_urls[category]):
-      if category == "status":
-        if len(row) == 4:
-          name, _, card_type, description = row
-          print("Found STS1 card {0}".format(name))
-          cards.append(Card(name, description, card_type, category, None, None, game="STS1"))
-
-      elif category == "Curse":
-        if len(row) == 4:
-          name, _, description, _ = row
-        elif len(row) == 3:
-          name, _, description = row
-
-        card_type = "Curse"
-        print("Found STS1 card {0}".format(name))
-        cards.append(Card(name, description, card_type, category, None, None, game="STS1"))
-
-      elif len(row) == 6:
-        name, _, rarity, card_type, energy, description = row
-        print("Found STS1 card {0}".format(name))
-        cards.append(Card(name, description, card_type, category, rarity, energy, game="STS1"))
-
-  return cards
-
 
 # =========================================================================
 # STS2 Gathering (from sts2.untapped.gg)
 # =========================================================================
 
-def _sts2_fetch(path):
-  """Fetch a page from sts2.untapped.gg and return BeautifulSoup."""
-  url = STS2_BASE + path
-  resp = requests.get(url, timeout=15)
-  resp.raise_for_status()
-  return BeautifulSoup(resp.text, "html.parser")
-
-def _sts2_parse_section_list(soup):
-  """Parse the untapped.gg list pages (relics, potions).
-
-  These pages use a repeated pattern of:
-    ## Name
-    ·CategoryRarity
-    Description text
-  """
-  items = []
-  # The readable content has ## headings for each item
-  text = soup.get_text("\n", strip=True)
-  return text
-
 def _sts2_extract_card_slugs():
   """Extract all card slugs from the STS2 cards page HTML."""
   resp = requests.get(STS2_BASE + "/en/cards", timeout=15)
-  # Find all /en/cards/<slug> links in the raw HTML
   slugs = re.findall(r'/en/cards/([a-z0-9_]+)', resp.text)
-  # Deduplicate while preserving order
   seen = set()
   unique = []
   for s in slugs:
@@ -175,13 +237,7 @@ def _sts2_extract_card_slugs():
   return unique
 
 def _sts2_parse_card_page(slug):
-  """Fetch and parse a single STS2 card page.
-  
-  Returns a Card object or None if parsing fails.
-  Page structure:
-    <title>Name - Category Rarity Type</title>
-    Body: description, then Character/Type/Cost/Rarity fields
-  """
+  """Fetch and parse a single STS2 card page."""
   url = STS2_BASE + "/en/cards/" + slug
   try:
     resp = requests.get(url, timeout=15)
@@ -191,31 +247,23 @@ def _sts2_parse_card_page(slug):
     return None
 
   soup = BeautifulSoup(resp.text, "html.parser")
-  
-  # Parse from <title>: "Name - Category Rarity Type"
+
   title_tag = soup.find("title")
   if not title_tag:
     return None
 
   title_text = title_tag.text.strip()
-  # Remove trailing " – Untapped.gg" or similar
   title_text = re.sub(r'\s*[–-]\s*Untapped\.gg\s*$', '', title_text)
-  
-  # Split: "Anger - Ironclad Common Attack"
+
   parts = title_text.split(" - ", 1)
   if len(parts) != 2:
     print("  Unexpected title format for {0}: {1}".format(slug, title_text))
     return None
 
   name = parts[0].strip()
-  meta = parts[1].strip()  # e.g. "Ironclad Common Attack"
-
-  # Extract readable text for description and metadata
   text = soup.get_text("\n", strip=True)
   lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-  # Find description — it's the first substantial line of text content
-  # Look for lines before the metadata fields
   description = ""
   category = None
   rarity = None
@@ -225,15 +273,13 @@ def _sts2_parse_card_page(slug):
   for line in lines:
     if line.startswith("Character"):
       category = line.replace("Character", "").strip()
-    elif line.startswith("Type"):
+    elif line.startswith("Type") and card_type is None:
       card_type = line.replace("Type", "").strip()
-    elif line.startswith("Cost"):
+    elif line.startswith("Cost") and cost is None:
       cost = line.replace("Cost", "").strip()
-    elif line.startswith("Rarity"):
+    elif line.startswith("Rarity") and rarity is None:
       rarity = line.replace("Rarity", "").strip()
 
-  # Description is typically the first content line that isn't the title or nav
-  # Find it by looking for text after the card name but before metadata
   found_name = False
   for line in lines:
     if name.lower() in line.lower() and not found_name:
@@ -254,8 +300,7 @@ def _sts2_parse_card_page(slug):
       break
 
   if not description:
-    # Fallback: use meta string
-    description = meta
+    description = parts[1].strip() if len(parts) > 1 else ""
 
   return Card(
     name=name,
@@ -268,7 +313,6 @@ def _sts2_parse_card_page(slug):
   )
 
 def GatherSTS2Cards():
-  """Gather all STS2 cards by fetching individual card pages."""
   print("\nGathering STS2 Cards...")
   slugs = _sts2_extract_card_slugs()
   print("Found {0} card slugs".format(len(slugs)))
@@ -279,81 +323,62 @@ def GatherSTS2Cards():
     if card:
       print("Found STS2 card {0} ({1}/{2})".format(card.name, i + 1, len(slugs)))
       cards.append(card)
-    # Be polite
     if (i + 1) % 10 == 0:
       time.sleep(0.5)
 
   return cards
 
-def GatherSTS2Relics():
-  """Gather STS2 relics from the relics listing page."""
-  print("\nGathering STS2 Relics...")
-  resp = requests.get(STS2_BASE + "/en/relics", timeout=15)
+def _sts2_parse_list_page(url):
+  """Parse a list page (relics/potions) from sts2.untapped.gg.
+  
+  Returns list of (name, meta_line, description) tuples.
+  Pattern: Name, then ·CategoryRarity, then description.
+  """
+  resp = requests.get(url, timeout=15)
   resp.raise_for_status()
   soup = BeautifulSoup(resp.text, "html.parser")
-
   text = soup.get_text("\n", strip=True)
   lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-  relics = []
+  items = []
   i = 0
   while i < len(lines):
-    line = lines[i]
-    # Relic entries follow the pattern from the markdown extraction:
-    # Name line, then ·CategoryRarity line, then description
     if i + 2 < len(lines) and lines[i + 1].startswith("·"):
-      name = line
+      name = lines[i]
       meta = lines[i + 1].lstrip("·").strip()
-      description = lines[i + 2] if i + 2 < len(lines) else ""
-
-      # Parse category from meta: e.g. "ColorlessUncommon", "IroncladRare"
-      # Category is character name, rarity is the rest
-      category = "Colorless"
-      for char_name in ["Ironclad", "Silent", "Defect", "Necrobinder", "Regent", "Colorless"]:
-        if meta.startswith(char_name):
-          category = char_name
-          break
-
-      print("Found STS2 relic {0}".format(name))
-      relics.append(Relic(name, description, category, game="STS2"))
+      description = lines[i + 2]
+      items.append((name, meta, description))
       i += 3
     else:
       i += 1
+  return items
 
+def GatherSTS2Relics():
+  print("\nGathering STS2 Relics...")
+  items = _sts2_parse_list_page(STS2_BASE + "/en/relics")
+  relics = []
+  for name, meta, description in items:
+    category = "Colorless"
+    for char_name in ["Ironclad", "Silent", "Defect", "Necrobinder", "Regent"]:
+      if meta.startswith(char_name):
+        category = char_name
+        break
+    print("Found STS2 relic {0}".format(name))
+    relics.append(Relic(name, description, category, game="STS2"))
   return relics
 
 def GatherSTS2Potions():
-  """Gather STS2 potions from the potions listing page."""
   print("\nGathering STS2 Potions...")
-  resp = requests.get(STS2_BASE + "/en/potions", timeout=15)
-  resp.raise_for_status()
-  soup = BeautifulSoup(resp.text, "html.parser")
-
-  text = soup.get_text("\n", strip=True)
-  lines = [l.strip() for l in text.split("\n") if l.strip()]
-
+  items = _sts2_parse_list_page(STS2_BASE + "/en/potions")
   potions = []
-  i = 0
-  while i < len(lines):
-    line = lines[i]
-    if i + 2 < len(lines) and lines[i + 1].startswith("·"):
-      name = line
-      meta = lines[i + 1].lstrip("·").strip()
-      description = lines[i + 2] if i + 2 < len(lines) else ""
-
-      # Parse rarity from meta: e.g. "ColorlessCommon", "IroncladUncommon"
-      rarity = "Common"
-      for r in ["Rare", "Uncommon", "Common"]:
-        if r in meta:
-          rarity = r
-          break
-
-      print("Found STS2 potion {0}".format(name))
-      potions.append(Potion(name, description, rarity, game="STS2"))
-      i += 3
-    else:
-      i += 1
-
+  for name, meta, description in items:
+    rarity = "Common"
+    for r in ["Rare", "Uncommon", "Common"]:
+      if r in meta:
+        rarity = r
+        break
+    print("Found STS2 potion {0}".format(name))
+    potions.append(Potion(name, description, rarity, game="STS2"))
   return potions
 
 
@@ -362,7 +387,7 @@ def GatherSTS2Potions():
 # =========================================================================
 
 def main():
-  # STS1
+  # STS1 (via MediaWiki API)
   cards = GatherCards()
   relics = GatherRelics()
   potions = GatherPotions()
