@@ -138,7 +138,7 @@ def GatherCards():
     "Ironclad": "Ironclad_Cards",
     "Silent": "Silent_Cards",
     "Defect": "Defect_Cards",
-    "Watcher": "Watcher_Cards_(BETA)",
+    "Watcher": "Watcher_Cards",
     "Colorless": "Colorless_Cards",
     "Status": "Status",
     "Curse": "Curse",
@@ -188,6 +188,9 @@ def GatherRelics():
   for row in _parse_wiki_table_rows(wikitext):
     if len(row) >= 4:
       _, name, category, description = row[0], row[1], row[2], row[3]
+      # Skip junk rows (CSS style strings parsed as data)
+      if name.startswith("style=") or "border" in name or len(name) > 100:
+        continue
       print("Found STS1 relic {0}".format(name))
       relics.append(Relic(name, description, category, game="STS1"))
 
@@ -288,6 +291,9 @@ def GatherEvents():
         names.append(display)
 
     for name in names:
+      # Skip junk entries (fragments from wikitext parsing)
+      if len(name) < 3 or "|" in name or "px" in name or name in ["first", "three", "two"]:
+        continue
       print("Found STS1 event {0} ({1})".format(name, act_name))
       description = _get_event_description(name)
       events.append(Event(name, description, act_name, game="STS1"))
@@ -301,15 +307,37 @@ def GatherEvents():
 # =========================================================================
 
 def _sts2_extract_card_slugs():
-  """Extract all card slugs from the STS2 cards page HTML."""
-  resp = requests.get(STS2_BASE + "/en/cards", timeout=15)
-  slugs = re.findall(r'/en/cards/([a-z0-9_]+)', resp.text)
+  """Extract all card slugs from STS2 per-character card pages.
+  
+  The main /en/cards page only loads ~90 slugs (JS lazy-loads the rest).
+  Per-character pages have all slugs for that character in the HTML.
+  """
+  characters = ["ironclad", "silent", "defect", "necrobinder", "regent", "colorless"]
   seen = set()
   unique = []
-  for s in slugs:
-    if s not in seen:
-      seen.add(s)
-      unique.append(s)
+
+  for char in characters:
+    url = STS2_BASE + "/en/tier-list/cards/" + char
+    try:
+      resp = requests.get(url, timeout=15)
+      slugs = re.findall(r'/en/cards/([a-z0-9_]+)', resp.text)
+      for s in slugs:
+        if s not in seen:
+          seen.add(s)
+          unique.append(s)
+    except Exception as e:
+      print("  Failed to fetch {0} cards: {1}".format(char, e))
+
+  # Also check the main cards page for any we missed
+  try:
+    resp = requests.get(STS2_BASE + "/en/cards", timeout=15)
+    for s in re.findall(r'/en/cards/([a-z0-9_]+)', resp.text):
+      if s not in seen:
+        seen.add(s)
+        unique.append(s)
+  except Exception:
+    pass
+
   return unique
 
 def _sts2_parse_card_page(slug):
@@ -433,7 +461,11 @@ def GatherSTS2Relics():
   print("\nGathering STS2 Relics...")
   items = _sts2_parse_list_page(STS2_BASE + "/en/relics")
   relics = []
+  seen_names = set()
   for name, meta, description in items:
+    if name in seen_names:
+      continue
+    seen_names.add(name)
     category = "Colorless"
     for char_name in ["Ironclad", "Silent", "Defect", "Necrobinder", "Regent"]:
       if meta.startswith(char_name):
@@ -447,7 +479,11 @@ def GatherSTS2Potions():
   print("\nGathering STS2 Potions...")
   items = _sts2_parse_list_page(STS2_BASE + "/en/potions")
   potions = []
+  seen_names = set()
   for name, meta, description in items:
+    if name in seen_names:
+      continue
+    seen_names.add(name)
     rarity = "Common"
     for r in ["Rare", "Uncommon", "Common"]:
       if r in meta:
