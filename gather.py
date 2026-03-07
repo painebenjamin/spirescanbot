@@ -210,13 +210,89 @@ def GatherPotions():
 
   return potions
 
+def _get_event_description(event_name):
+  """Fetch an event's description from its wiki page via API."""
+  # Convert name to wiki page title
+  page_title = event_name.replace(" ", "_")
+  try:
+    wikitext = _get_wikitext(page_title)
+  except Exception:
+    # Some events have "(Event)" suffix
+    try:
+      wikitext = _get_wikitext(page_title + "_(Event)")
+    except Exception:
+      return ""
+
+  # Find first real text paragraph (skip images, templates, sections, categories)
+  lines = wikitext.split("\n")
+  for line in lines:
+    line = line.strip()
+    # Skip empty, images, templates, sections, categories, TOC
+    if not line or line.startswith("[[File:") or line.startswith("[[Category"):
+      continue
+    if line.startswith("{") or line.startswith("=") or line.startswith("__"):
+      continue
+    if line.startswith("*") or line.startswith("#") or line.startswith("|") or line.startswith("!"):
+      continue
+    # This looks like a description line
+    cleaned = _clean_wikitext(line)
+    if len(cleaned) > 20:
+      return cleaned
+
+  return ""
+
 def GatherEvents():
+  """Gather STS1 events from the Events wiki page."""
   events = []
-  data = json.loads(open(os.path.join(os.path.dirname(__file__), "events.json"), "r").read())
-  for act in data:
-    for name in data[act]:
-      print("Found STS1 event {0}".format(name))
-      events.append(Event(name, data[act][name], act, game="STS1"))
+  print("Gathering STS1 Events")
+
+  # First try the events.json fallback if it exists
+  events_json = os.path.join(os.path.dirname(__file__), "events.json")
+  if os.path.exists(events_json):
+    data = json.loads(open(events_json, "r").read())
+    for act in data:
+      for name in data[act]:
+        print("Found STS1 event {0} (from events.json)".format(name))
+        events.append(Event(name, data[act][name], act, game="STS1"))
+    if events:
+      return events
+
+  # Fallback: scrape from wiki API
+  try:
+    wikitext = _get_wikitext("Events")
+  except Exception as e:
+    print("  Failed to fetch Events: {0}".format(e))
+    return events
+
+  # Split by section divs
+  section_map = {
+    "common_events": "Common",
+    "act1_events": "Act 1 (The Exordium)",
+    "act2_events": "Act 2 (The City)",
+    "act3_events": "Act 3 (The Beyond)",
+  }
+
+  sections = re.split(r'<div id="(\w+_events)"', wikitext)
+
+  for i in range(1, len(sections), 2):
+    section_id = sections[i]
+    section_text = sections[i + 1] if i + 1 < len(sections) else ""
+    act_name = section_map.get(section_id, section_id)
+
+    # Extract event names from {{ficon|Icon.png|Name|100px}} templates
+    names = re.findall(r'\{\{ficon\|[^|]+\|([^|]+)\|', section_text)
+    # Also from [[Page (Event)|Display Name]] links
+    link_names = re.findall(r'\[\[([^|\]]+?)(?:\s*\(Event\))?\|([^\]]+)\]\]', section_text)
+    for page, display in link_names:
+      if display not in names and "Act" not in display and "File:" not in display:
+        names.append(display)
+
+    for name in names:
+      print("Found STS1 event {0} ({1})".format(name, act_name))
+      description = _get_event_description(name)
+      events.append(Event(name, description, act_name, game="STS1"))
+      time.sleep(0.2)  # Be polite to the API
+
   return events
 
 
