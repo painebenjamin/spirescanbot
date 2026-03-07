@@ -101,36 +101,46 @@ def _parse_wiki_table_rows(wikitext):
 
   Yields lists of cell values (cleaned) for each row.
   Rows start with |- and cells start with |.
+  Multi-line cells (continuation lines) are appended to the last cell.
   """
   in_table = False
   current_row = []
+  # Track raw (uncleaned) cell parts so multi-line cells are joined before cleaning
+  raw_cells = []
+
+  def _finish_row():
+    """Clean accumulated raw cells and return as a row."""
+    return [_clean_wikitext(cell) for cell in raw_cells]
 
   for line in wikitext.split("\n"):
-    line = line.strip()
-    if line.startswith("{|"):
+    stripped = line.strip()
+    if stripped.startswith("{|"):
       in_table = True
       continue
-    if line.startswith("|}"):
-      if current_row:
-        yield current_row
+    if stripped.startswith("|}"):
+      if raw_cells:
+        yield _finish_row()
       in_table = False
-      current_row = []
+      raw_cells = []
       continue
     if not in_table:
       continue
-    if line.startswith("!"):
+    if stripped.startswith("!"):
       continue  # Header row
-    if line.startswith("|-"):
-      if current_row:
-        yield current_row
-      current_row = []
+    if stripped.startswith("|-"):
+      if raw_cells:
+        yield _finish_row()
+      raw_cells = []
       continue
-    if line.startswith("|"):
-      cell = line[1:].strip()
-      current_row.append(_clean_wikitext(cell))
+    if stripped.startswith("|"):
+      cell = stripped[1:].strip()
+      raw_cells.append(cell)
+    elif raw_cells and stripped:
+      # Continuation of the previous cell (multi-line description)
+      raw_cells[-1] += " " + stripped
 
-  if current_row:
-    yield current_row
+  if raw_cells:
+    yield _finish_row()
 
 
 # =========================================================================
