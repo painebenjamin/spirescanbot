@@ -145,6 +145,19 @@ def format_card(card_dict):
         rarity = card_dict["rarity"] or "?",
         type = card_dict["card_type"] or "?"
       )
+
+  # Format cost string, including star cost for Regent cards
+  cost_str = "Unplayable"
+  if card_dict["cost"] is not None:
+    cost_str = "{0} Energy".format(card_dict["cost"])
+  star_cost = card_dict.get("star_cost")
+  if star_cost:
+    star_display = "\u2b50" * int(star_cost)  # star emoji x N
+    if card_dict["cost"] is not None:
+      cost_str = "{0} Energy {1}".format(card_dict["cost"], star_display)
+    else:
+      cost_str = star_display
+
   return """[{name:s}]({url:s}) {tag:s} {title:s}
 
 {cost:s} | {description:s}""".format(
@@ -152,7 +165,7 @@ def format_card(card_dict):
     url = wiki_url(card_dict["name"], game),
     tag = game_tag(card_dict),
     title = format_card_title(),
-    cost = "Unplayable" if card_dict["cost"] is None else "{0} Energy".format(card_dict["cost"]),
+    cost = cost_str,
     description = replace_energy(
       highlight_key_words(card_dict["description"])
     )
@@ -218,6 +231,22 @@ def highlight_key_words(string):
     "conjure",
     "decree",
     "soot",
+    "sly",
+    "forge",
+    "soul",
+    "souls",
+    "debris",
+    "fuel",
+    "fatal",
+    "eternal",
+    "osty",
+    "frost",
+    "plating",
+    "doom",
+    "replay",
+    "glass",
+    "stars",
+    "star",
   ]
 
   return " ".join([

@@ -6,7 +6,8 @@ import os
 import re
 import time
 import yaml
-# No longer need BeautifulSoup - using meta tags + RSC parsing
+import html as html_module
+from difflib import SequenceMatcher
 
 # --- STS1 sources (MediaWiki API — Cloudflare blocks HTML scraping now) ---
 STS1_API = "https://slay-the-spire.fandom.com/api.php"
@@ -21,7 +22,8 @@ class SpireObject(object):
     return str(dict(vars(self)))
 
 class Card(SpireObject):
-  def __init__(self, name, description, card_type, category, rarity, cost, game="STS1"):
+  def __init__(self, name, description, card_type, category, rarity, cost,
+               game="STS1", star_cost=None):
     self.type = "Card"
     self.game = game
     self.name = name.replace("\n", " ").strip()
@@ -30,6 +32,8 @@ class Card(SpireObject):
     self.category = category
     self.rarity = rarity
     self.cost = cost
+    if star_cost is not None:
+      self.star_cost = star_cost
 
 class Relic(SpireObject):
   def __init__(self, name, description, category, game="STS1"):
@@ -62,14 +66,14 @@ class Event(SpireObject):
 
 def _clean_wikitext(text):
   """Strip wikitext markup to plain text."""
-  # Remove {{KW|...}} and {{C|...}} templates → just the first arg
+  # Remove {{KW|...}} and {{C|...}} templates -> just the first arg
   text = re.sub(r'\{\{KW\|([^}|]+)(?:\|[^}]*)?\}\}', r'\1', text)
   text = re.sub(r'\{\{C\|([^}|]+)(?:\|[^}]*)?\}\}', r'\1', text)
   # Remove other templates
   text = re.sub(r'\{\{[^}]*\}\}', '', text)
-  # Remove [[File:...]] 
+  # Remove [[File:...]]
   text = re.sub(r'\[\[File:[^\]]*\]\]', '', text)
-  # Convert [[Page|Display]] → Display, [[Page]] → Page
+  # Convert [[Page|Display]] -> Display, [[Page]] -> Page
   text = re.sub(r'\[\[([^]|]*)\|([^\]]*)\]\]', r'\2', text)
   text = re.sub(r'\[\[([^\]]*)\]\]', r'\1', text)
   # Remove bold/italic markup
@@ -94,7 +98,7 @@ def _get_wikitext(page):
 
 def _parse_wiki_table_rows(wikitext):
   """Parse rows from a wikitext table.
-  
+
   Yields lists of cell values (cleaned) for each row.
   Rows start with |- and cells start with |.
   """
@@ -215,29 +219,24 @@ def GatherPotions():
 
 def _get_event_description(event_name):
   """Fetch an event's description from its wiki page via API."""
-  # Convert name to wiki page title
   page_title = event_name.replace(" ", "_")
   try:
     wikitext = _get_wikitext(page_title)
   except Exception:
-    # Some events have "(Event)" suffix
     try:
       wikitext = _get_wikitext(page_title + "_(Event)")
     except Exception:
       return ""
 
-  # Find first real text paragraph (skip images, templates, sections, categories)
   lines = wikitext.split("\n")
   for line in lines:
     line = line.strip()
-    # Skip empty, images, templates, sections, categories, TOC
     if not line or line.startswith("[[File:") or line.startswith("[[Category"):
       continue
     if line.startswith("{") or line.startswith("=") or line.startswith("__"):
       continue
     if line.startswith("*") or line.startswith("#") or line.startswith("|") or line.startswith("!"):
       continue
-    # This looks like a description line
     cleaned = _clean_wikitext(line)
     if len(cleaned) > 20:
       return cleaned
@@ -249,7 +248,6 @@ def GatherEvents():
   events = []
   print("Gathering STS1 Events")
 
-  # First try the events.json fallback if it exists
   events_json = os.path.join(os.path.dirname(__file__), "events.json")
   if os.path.exists(events_json):
     data = json.loads(open(events_json, "r").read())
@@ -260,14 +258,12 @@ def GatherEvents():
     if events:
       return events
 
-  # Fallback: scrape from wiki API
   try:
     wikitext = _get_wikitext("Events")
   except Exception as e:
     print("  Failed to fetch Events: {0}".format(e))
     return events
 
-  # Split by section divs
   section_map = {
     "common_events": "Common",
     "act1_events": "Act 1 (The Exordium)",
@@ -282,24 +278,195 @@ def GatherEvents():
     section_text = sections[i + 1] if i + 1 < len(sections) else ""
     act_name = section_map.get(section_id, section_id)
 
-    # Extract event names from {{ficon|Icon.png|Name|100px}} templates
     names = re.findall(r'\{\{ficon\|[^|]+\|([^|]+)\|', section_text)
-    # Also from [[Page (Event)|Display Name]] links
     link_names = re.findall(r'\[\[([^|\]]+?)(?:\s*\(Event\))?\|([^\]]+)\]\]', section_text)
     for page, display in link_names:
       if display not in names and "Act" not in display and "File:" not in display:
         names.append(display)
 
     for name in names:
-      # Skip junk entries (fragments from wikitext parsing)
       if len(name) < 3 or "|" in name or "px" in name or name in ["first", "three", "two"]:
         continue
       print("Found STS1 event {0} ({1})".format(name, act_name))
       description = _get_event_description(name)
       events.append(Event(name, description, act_name, game="STS1"))
-      time.sleep(0.2)  # Be polite to the API
+      time.sleep(0.2)
 
   return events
+
+
+# =========================================================================
+# STS2 HTML parsing helpers
+# =========================================================================
+
+def _unescape_html(text):
+  """Unescape HTML entities: &#x27; -> ', &amp; -> &, etc."""
+  return html_module.unescape(text)
+
+def _extract_description_from_html(html_fragment):
+  """Extract card description text from an HTML fragment (foreignObject content).
+
+  Handles:
+  - <img alt="Regent Star Energy"> -> star marker (counted)
+  - <img alt="X Energy"> -> energy marker (counted)
+  - <span class="...mechanic">keyword</span> -> keyword text
+  - <br/> -> sentence separator
+  """
+  # Replace star energy images with placeholder
+  text = re.sub(r'<img[^>]*alt="[^"]*Star Energy"[^>]*/?\s*>', '\x01S\x01', html_fragment)
+  # Replace regular energy images with placeholder
+  text = re.sub(r'<img[^>]*alt="[^"]*Energy"[^>]*/?\s*>', '\x01E\x01', text)
+  # Replace <br/> with sentence separator
+  text = re.sub(r'<br\s*/?>', ' ', text)
+  # Strip all remaining HTML tags
+  text = re.sub(r'<[^>]+>', '', text)
+  # Unescape HTML entities
+  text = _unescape_html(text)
+  # Clean up whitespace
+  text = re.sub(r'\s+', ' ', text).strip()
+
+  # Normalize energy/star sequences:
+  # 1. Number followed by energy icon(s) (with optional space): "4\x01E\x01" -> "4 Energy"
+  def _replace_numbered_energy(m):
+    return m.group(1) + ' Energy'
+  text = re.sub(r'(\d)\s*(\x01E\x01)+', _replace_numbered_energy, text)
+
+  # 2. Standalone energy icons: "\x01E\x01\x01E\x01" -> "2 Energy"
+  def _replace_energy(m):
+    count = m.group(0).count('\x01E\x01')
+    return '{0} Energy'.format(count)
+  text = re.sub(r'(\x01E\x01)+', _replace_energy, text)
+
+  # 3. Number followed by star icon(s) (with optional space)
+  def _replace_numbered_stars(m):
+    return m.group(1) + ' Stars'
+  text = re.sub(r'(\d)\s*(\x01S\x01)+', _replace_numbered_stars, text)
+
+  # 4. Standalone star icons: "\x01S\x01\x01S\x01\x01S\x01" -> "3 Stars"
+  def _replace_stars(m):
+    count = m.group(0).count('\x01S\x01')
+    return '{0} Stars'.format(count)
+  text = re.sub(r'(\x01S\x01)+', _replace_stars, text)
+
+  # Fix missing spaces where word runs into number: "Gain3" -> "Gain 3"
+  text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
+  # Fix stray spaces before punctuation: "something ." -> "something."
+  text = re.sub(r'\s+([.,;:!?])', r'\1', text)
+  # Clean up multiple spaces
+  text = re.sub(r'\s+', ' ', text)
+
+  return text.strip()
+
+def _compute_upgrade_diff(base_text, upgrade_text):
+  """Compute a parenthesized diff between base and upgraded card text.
+
+  Examples:
+    "Deal 6 damage." + "Deal 9 damage." -> "Deal 6(9) damage."
+    "Gain 2 Stars." + "Gain 3 Stars." -> "Gain 2(3) Stars."
+    "Draw 1 card." + "Draw 2 cards." -> "Draw 1(2) card(s)."
+  """
+  if not base_text or not upgrade_text:
+    return base_text or ""
+  if base_text == upgrade_text:
+    return base_text
+
+  base_words = base_text.split()
+  upg_words = upgrade_text.split()
+
+  # Use SequenceMatcher for alignment
+  matcher = SequenceMatcher(None, base_words, upg_words)
+  result = []
+
+  for op, i1, i2, j1, j2 in matcher.get_opcodes():
+    if op == 'equal':
+      result.extend(base_words[i1:i2])
+    elif op == 'replace':
+      base_chunk = base_words[i1:i2]
+      upg_chunk = upg_words[j1:j2]
+      if len(base_chunk) == len(upg_chunk):
+        # Word-by-word replacement
+        for bw, uw in zip(base_chunk, upg_chunk):
+          result.append(_diff_word(bw, uw))
+      elif len(base_chunk) == 1 and len(upg_chunk) == 1:
+        result.append(_diff_word(base_chunk[0], upg_chunk[0]))
+      else:
+        # Multi-word replacement — show inline
+        result.append('{0}({1})'.format(
+          ' '.join(base_chunk), ' '.join(upg_chunk)
+        ))
+    elif op == 'insert':
+      # Words added in upgrade
+      added = ' '.join(upg_words[j1:j2])
+      result.append('({0})'.format(added))
+    elif op == 'delete':
+      # Words removed in upgrade — show with strikethrough notation
+      removed = ' '.join(base_words[i1:i2])
+      result.append(removed)
+
+  return ' '.join(result)
+
+
+def _diff_word(base_word, upg_word):
+  """Diff a single word pair, handling numbers, pluralization, punctuation."""
+  if base_word == upg_word:
+    return base_word
+
+  # Strip trailing punctuation for comparison
+  base_stripped = base_word.rstrip('.,;:!?')
+  upg_stripped = upg_word.rstrip('.,;:!?')
+  base_punct = base_word[len(base_stripped):]
+  upg_punct = upg_word[len(upg_stripped):]
+  # Use base punctuation (usually same)
+  punct = base_punct or upg_punct
+
+  if base_stripped == upg_stripped:
+    return base_word  # Only punctuation differs
+
+  # Check if both are numbers
+  if _is_number(base_stripped) and _is_number(upg_stripped):
+    return '{0}({1}){2}'.format(base_stripped, upg_stripped, punct)
+
+  # Check pluralization: "card" -> "cards", "time" -> "times"
+  if upg_stripped == base_stripped + 's' or upg_stripped == base_stripped + 'es':
+    return base_stripped + '(s)' + punct
+
+  # Check "a" -> "ALL", "random" -> "not random" etc.
+  # For simple word changes, parenthesize
+  return '{0}({1}){2}'.format(base_stripped, upg_stripped, punct)
+
+
+def _is_number(s):
+  """Check if string is a number (int or X for variable cost)."""
+  try:
+    int(s)
+    return True
+  except ValueError:
+    return s == 'X'
+
+
+def _extract_upgrade_cost(page_html):
+  """Extract upgrade cost change from the upgradeDetails section.
+
+  Returns (base_cost, upgrade_cost) if cost changes, else (None, None).
+  Pattern: "Cost changes from 3 to 2"
+  """
+  upg_match = re.search(
+    r'upgradeDetails[^>]*>(.*?)</div>\s*</div>\s*</div>',
+    page_html, re.DOTALL
+  )
+  if not upg_match:
+    return None, None
+
+  raw = upg_match.group(1)
+  # Strip tags
+  text = re.sub(r'<[^>]+>', ' ', raw)
+  text = re.sub(r'\s+', ' ', text).strip()
+
+  cost_match = re.search(r'Cost changes from (\d+) to (\d+)', text)
+  if cost_match:
+    return cost_match.group(1), cost_match.group(2)
+
+  return None, None
 
 
 # =========================================================================
@@ -308,7 +475,7 @@ def GatherEvents():
 
 def _sts2_extract_card_slugs():
   """Extract all card slugs from STS2 per-character card pages.
-  
+
   The main /en/cards page only loads ~90 slugs (JS lazy-loads the rest).
   Per-character pages have all slugs for that character in the HTML.
   """
@@ -341,12 +508,13 @@ def _sts2_extract_card_slugs():
   return unique
 
 def _sts2_parse_card_page(slug):
-  """Fetch and parse a single STS2 card page using meta tags.
+  """Fetch and parse a single STS2 card page.
 
-  Meta description format:
-    "Name is a Cost-Cost Rarity Type card in the Character pool: Description."
-  Title format:
-    "Name - Character Rarity Type - Slay the Spire 2 – Untapped.gg"
+  Uses:
+  - Meta tags for structured data (name, category, rarity, type, cost)
+  - foreignObject elements for accurate base + upgrade descriptions
+  - starCost SVG for Regent star costs
+  - upgradeDetails for cost-only upgrades
   """
   url = STS2_BASE + "/en/cards/" + slug
   try:
@@ -356,41 +524,38 @@ def _sts2_parse_card_page(slug):
     print("  Failed to fetch card {0}: {1}".format(slug, e))
     return None
 
-  text = resp.text
+  page_html = resp.text
 
-  # Parse title: "Name - Character Rarity Type - Slay the Spire 2 – Untapped.gg"
-  title_match = re.search(r'<title>([^<]+)</title>', text)
+  # --- Parse structured info from meta tags ---
+  title_match = re.search(r'<title>([^<]+)</title>', page_html)
   if not title_match:
     return None
   title = title_match.group(1).strip()
-  title = re.sub(r'\s*[–-]\s*Untapped\.gg\s*$', '', title)
-  title = re.sub(r'\s*[–-]\s*Slay the Spire 2\s*$', '', title)
+  title = _unescape_html(title)
+  title = re.sub(r'\s*[\u2013-]\s*Untapped\.gg\s*$', '', title)
+  title = re.sub(r'\s*[\u2013-]\s*Slay the Spire 2\s*$', '', title)
 
-  # Split: "Name - Character Rarity Type"
   parts = title.split(" - ", 1)
   name = parts[0].strip()
 
-  # Parse meta description: structured card info
   desc_match = re.search(
-    r'<meta[^>]*name="description"[^>]*content="([^"]+)"', text
+    r'<meta[^>]*name="description"[^>]*content="([^"]+)"', page_html
   )
   if not desc_match:
     desc_match = re.search(
-      r'<meta[^>]*property="og:description"[^>]*content="([^"]+)"', text
+      r'<meta[^>]*property="og:description"[^>]*content="([^"]+)"', page_html
     )
 
-  description = ""
   cost = None
   rarity = None
   card_type = None
   category = None
 
   if desc_match:
-    meta_desc = desc_match.group(1)
-    # Pattern: "Name is a 2-Cost Rare Attack card in the Ironclad pool: Deal 8 damage."
-    # Or: "Name is a 0-Cost Attack card in the Ironclad pool: ..." (no rarity)
+    meta_desc = _unescape_html(desc_match.group(1))
+    # Handle X-Cost cards: "X-Cost" in meta
     info_match = re.match(
-      r'.+? is a (\d+)-Cost\s+(?:(Common|Uncommon|Rare)\s+)?'
+      r'.+? is an? ([\dX]+)-Cost\s+(?:(Common|Uncommon|Rare|Basic)\s+)?'
       r'(Attack|Skill|Power|Status|Curse)\s+card in the (\w+) pool:\s*(.+)',
       meta_desc
     )
@@ -399,12 +564,6 @@ def _sts2_parse_card_page(slug):
       rarity = info_match.group(2) or "Basic"
       card_type = info_match.group(3)
       category = info_match.group(4)
-      description = info_match.group(5).strip().rstrip('.')
-    else:
-      # Fallback: grab everything after the colon
-      colon_idx = meta_desc.find(": ")
-      if colon_idx > 0:
-        description = meta_desc[colon_idx + 2:].strip()
 
   # Fallback category/rarity from title parts
   if len(parts) > 1 and (not category or not rarity):
@@ -413,10 +572,51 @@ def _sts2_parse_card_page(slug):
     if not category and tokens:
       category = tokens[0]
     for t in tokens:
-      if t in ("Common", "Uncommon", "Rare") and not rarity:
+      if t in ("Common", "Uncommon", "Rare", "Basic") and not rarity:
         rarity = t
       if t in ("Attack", "Skill", "Power", "Status", "Curse") and not card_type:
         card_type = t
+
+  # --- Parse descriptions from foreignObject elements ---
+  # First foreignObject = base card, second = upgraded card (in display:none div)
+  foreign_objects = re.findall(
+    r'<foreignObject[^>]*>(.*?)</foreignObject>',
+    page_html, re.DOTALL
+  )
+
+  base_desc = ""
+  upgrade_desc = ""
+
+  if len(foreign_objects) >= 1:
+    base_desc = _extract_description_from_html(foreign_objects[0])
+  if len(foreign_objects) >= 2:
+    upgrade_desc = _extract_description_from_html(foreign_objects[1])
+
+  # --- Parse star cost from SVG (only from the main card, not OTHER CARDS) ---
+  star_cost = None
+  # The main card is before the "otherCards" or "upgradeDetails" sections
+  # Find the first starCost SVG that appears before the OTHER CARDS section
+  other_cards_pos = page_html.find('otherCards')
+  search_region = page_html[:other_cards_pos] if other_cards_pos > 0 else page_html
+  star_match = re.search(
+    r'starCost[^>]*>.*?<text[^>]*>(\d+)</text>',
+    search_region, re.DOTALL
+  )
+  if star_match:
+    star_cost = star_match.group(1)
+
+  # --- Compute upgrade diff ---
+  description = base_desc
+  if upgrade_desc and upgrade_desc != base_desc:
+    description = _compute_upgrade_diff(base_desc, upgrade_desc)
+
+  # --- Check for cost-only upgrades ---
+  old_cost, new_cost = _extract_upgrade_cost(page_html)
+  if old_cost and new_cost and old_cost != new_cost:
+    cost = '{0}({1})'.format(old_cost, new_cost)
+
+  # Unescape name
+  name = _unescape_html(name)
 
   return Card(
     name=name,
@@ -426,6 +626,7 @@ def _sts2_parse_card_page(slug):
     rarity=rarity or "Basic",
     cost=cost,
     game="STS2",
+    star_cost=star_cost,
   )
 
 def GatherSTS2Cards():
@@ -447,7 +648,7 @@ def GatherSTS2Cards():
 def _sts2_parse_rsc_list(url):
   """Parse a list page (relics/potions) from sts2.untapped.gg by extracting
   React Server Component (RSC) data from self.__next_f.push() script blocks.
-  
+
   Returns list of (name, character, rarity, description) tuples.
   """
   resp = requests.get(url, timeout=15)
@@ -459,8 +660,7 @@ def _sts2_parse_rsc_list(url):
   rsc_text = "\n".join(rsc_chunks)
   rsc_text = rsc_text.replace('\\"', '"').replace('\\n', '\n')
 
-  # Build a map of deferred ref IDs → description text
-  # Pattern: hex_id:["$","span",null,{"className":"$undefined","children":[[...spans...]]}]
+  # Build a map of deferred ref IDs -> description text
   ref_map = {}
   desc_ref_pattern = re.compile(
     r'([0-9a-f]+):\["\$","span",null,\{"className":"\$undefined","children":'
@@ -470,13 +670,15 @@ def _sts2_parse_rsc_list(url):
   for m in desc_ref_pattern.finditer(rsc_text):
     ref_id = m.group(1)
     children_str = m.group(2)
+    # Extract text from children, handling energy/star alt text
     text_parts = re.findall(r'"children":"([^"]*)"', children_str)
+    # Also look for energy image alt texts
+    alt_parts = re.findall(r'"alt":"([^"]*Energy)"', children_str)
     full_text = "".join(text_parts).strip()
     if full_text:
-      ref_map[ref_id] = full_text
+      ref_map[ref_id] = _unescape_html(full_text)
 
   # Find each item entry by its UPPER_CASE key in a div with __relic className
-  # The CSS module hash varies per page, so match any hash pattern
   item_pattern = re.compile(
     r'\["\$","div","([A-Z][A-Z0-9_\'!? ]*)",\{"className":"[^"]*__relic"'
   )
@@ -486,39 +688,42 @@ def _sts2_parse_rsc_list(url):
   item_keys = [(m.group(1), m.start()) for m in item_pattern.finditer(rsc_text)]
 
   for idx, (key, start_pos) in enumerate(item_keys):
-    # Skip duplicates (page may render items twice)
     if key in seen_keys:
       continue
     seen_keys.add(key)
 
-    # Get the text slice for this item (until next item or +2000 chars)
     end_pos = item_keys[idx + 1][1] if idx + 1 < len(item_keys) else start_pos + 2000
     slice_text = rsc_text[start_pos:end_pos]
 
-    # Extract name from h2
     h2_match = re.search(r'\["\$","h2",null,\{"children":"([^"]+)"\}]', slice_text)
     if not h2_match:
       continue
-    name = h2_match.group(1)
+    item_name = _unescape_html(h2_match.group(1))
 
-    # Extract character and rarity from detail spans (after spacer ·)
     detail_match = re.search(
-      r'"children":"·"\}]'
+      r'"children":"\xb7"\}]'
       r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]'
       r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]',
       slice_text, re.DOTALL
     )
+    if not detail_match:
+      # Try with escaped middot
+      detail_match = re.search(
+        r'"children":"\\u00b7"\}]'
+        r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]'
+        r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]',
+        slice_text, re.DOTALL
+      )
     character = detail_match.group(1) if detail_match else "Colorless"
     rarity = detail_match.group(2) if detail_match else "Unknown"
 
-    # Extract description via deferred ref: "children":"$L<hex>"
     desc_ref_match = re.search(r'description","children":"\$L([0-9a-f]+)"', slice_text)
     description = ""
     if desc_ref_match:
       ref_id = desc_ref_match.group(1)
       description = ref_map.get(ref_id, "")
 
-    items.append((name, character, rarity, description))
+    items.append((item_name, character, rarity, _unescape_html(description)))
 
   return items
 
@@ -531,9 +736,7 @@ def GatherSTS2Relics():
     if name in seen_names:
       continue
     seen_names.add(name)
-    # Character from the RSC data is the class affinity
     category = character if character != "Colorless" else rarity
-    # If rarity is actually a class name, fix up
     if category in ("Common", "Uncommon", "Rare", "Starter", "Boss", "Event",
                      "Shop", "Ancient", "Basic", "Unknown"):
       category = character
