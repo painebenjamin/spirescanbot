@@ -6,7 +6,7 @@ import os
 import re
 import time
 import yaml
-from bs4 import BeautifulSoup
+# No longer need BeautifulSoup - using meta tags + RSC parsing
 
 # --- STS1 sources (MediaWiki API — Cloudflare blocks HTML scraping now) ---
 STS1_API = "https://slay-the-spire.fandom.com/api.php"
@@ -341,7 +341,13 @@ def _sts2_extract_card_slugs():
   return unique
 
 def _sts2_parse_card_page(slug):
-  """Fetch and parse a single STS2 card page."""
+  """Fetch and parse a single STS2 card page using meta tags.
+
+  Meta description format:
+    "Name is a Cost-Cost Rarity Type card in the Character pool: Description."
+  Title format:
+    "Name - Character Rarity Type - Slay the Spire 2 – Untapped.gg"
+  """
   url = STS2_BASE + "/en/cards/" + slug
   try:
     resp = requests.get(url, timeout=15)
@@ -350,68 +356,74 @@ def _sts2_parse_card_page(slug):
     print("  Failed to fetch card {0}: {1}".format(slug, e))
     return None
 
-  soup = BeautifulSoup(resp.text, "html.parser")
+  text = resp.text
 
-  title_tag = soup.find("title")
-  if not title_tag:
+  # Parse title: "Name - Character Rarity Type - Slay the Spire 2 – Untapped.gg"
+  title_match = re.search(r'<title>([^<]+)</title>', text)
+  if not title_match:
     return None
+  title = title_match.group(1).strip()
+  title = re.sub(r'\s*[–-]\s*Untapped\.gg\s*$', '', title)
+  title = re.sub(r'\s*[–-]\s*Slay the Spire 2\s*$', '', title)
 
-  title_text = title_tag.text.strip()
-  title_text = re.sub(r'\s*[–-]\s*Untapped\.gg\s*$', '', title_text)
-
-  parts = title_text.split(" - ", 1)
-  if len(parts) != 2:
-    print("  Unexpected title format for {0}: {1}".format(slug, title_text))
-    return None
-
+  # Split: "Name - Character Rarity Type"
+  parts = title.split(" - ", 1)
   name = parts[0].strip()
-  text = soup.get_text("\n", strip=True)
-  lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+  # Parse meta description: structured card info
+  desc_match = re.search(
+    r'<meta[^>]*name="description"[^>]*content="([^"]+)"', text
+  )
+  if not desc_match:
+    desc_match = re.search(
+      r'<meta[^>]*property="og:description"[^>]*content="([^"]+)"', text
+    )
 
   description = ""
-  category = None
+  cost = None
   rarity = None
   card_type = None
-  cost = None
+  category = None
 
-  for line in lines:
-    if line.startswith("Character"):
-      category = line.replace("Character", "").strip()
-    elif line.startswith("Type") and card_type is None:
-      card_type = line.replace("Type", "").strip()
-    elif line.startswith("Cost") and cost is None:
-      cost = line.replace("Cost", "").strip()
-    elif line.startswith("Rarity") and rarity is None:
-      rarity = line.replace("Rarity", "").strip()
+  if desc_match:
+    meta_desc = desc_match.group(1)
+    # Pattern: "Name is a 2-Cost Rare Attack card in the Ironclad pool: Deal 8 damage."
+    # Or: "Name is a 0-Cost Attack card in the Ironclad pool: ..." (no rarity)
+    info_match = re.match(
+      r'.+? is a (\d+)-Cost\s+(?:(Common|Uncommon|Rare)\s+)?'
+      r'(Attack|Skill|Power|Status|Curse)\s+card in the (\w+) pool:\s*(.+)',
+      meta_desc
+    )
+    if info_match:
+      cost = info_match.group(1)
+      rarity = info_match.group(2) or "Basic"
+      card_type = info_match.group(3)
+      category = info_match.group(4)
+      description = info_match.group(5).strip().rstrip('.')
+    else:
+      # Fallback: grab everything after the colon
+      colon_idx = meta_desc.find(": ")
+      if colon_idx > 0:
+        description = meta_desc[colon_idx + 2:].strip()
 
-  found_name = False
-  for line in lines:
-    if name.lower() in line.lower() and not found_name:
-      found_name = True
-      continue
-    if found_name and line not in [name] and not line.startswith("Character") \
-        and not line.startswith("Type") and not line.startswith("Cost") \
-        and not line.startswith("Rarity") and len(line) > 5 \
-        and "untapped" not in line.lower() \
-        and "UPGRADED" not in line \
-        and not line.startswith("##") \
-        and "Jorbs" not in line \
-        and "twitch.tv" not in line \
-        and "youtube" not in line \
-        and "OTHER CARDS" not in line \
-        and "STS 1" not in line and "STS 2" not in line:
-      description = line
-      break
-
-  if not description:
-    description = parts[1].strip() if len(parts) > 1 else ""
+  # Fallback category/rarity from title parts
+  if len(parts) > 1 and (not category or not rarity):
+    info = parts[1].strip()
+    tokens = info.split()
+    if not category and tokens:
+      category = tokens[0]
+    for t in tokens:
+      if t in ("Common", "Uncommon", "Rare") and not rarity:
+        rarity = t
+      if t in ("Attack", "Skill", "Power", "Status", "Curse") and not card_type:
+        card_type = t
 
   return Card(
     name=name,
     description=description,
     card_type=card_type or "Unknown",
     category=category or "Unknown",
-    rarity=rarity or "Unknown",
+    rarity=rarity or "Basic",
     cost=cost,
     game="STS2",
   )
@@ -432,63 +444,112 @@ def GatherSTS2Cards():
 
   return cards
 
-def _sts2_parse_list_page(url):
-  """Parse a list page (relics/potions) from sts2.untapped.gg.
+def _sts2_parse_rsc_list(url):
+  """Parse a list page (relics/potions) from sts2.untapped.gg by extracting
+  React Server Component (RSC) data from self.__next_f.push() script blocks.
   
-  Returns list of (name, meta_line, description) tuples.
-  Pattern: Name, then ·CategoryRarity, then description.
+  Returns list of (name, character, rarity, description) tuples.
   """
   resp = requests.get(url, timeout=15)
   resp.raise_for_status()
-  soup = BeautifulSoup(resp.text, "html.parser")
-  text = soup.get_text("\n", strip=True)
-  lines = [l.strip() for l in text.split("\n") if l.strip()]
+  text = resp.text
+
+  # Collect all RSC push payloads and unescape them
+  rsc_chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', text, re.DOTALL)
+  rsc_text = "\n".join(rsc_chunks)
+  rsc_text = rsc_text.replace('\\"', '"').replace('\\n', '\n')
+
+  # Build a map of deferred ref IDs → description text
+  # Pattern: hex_id:["$","span",null,{"className":"$undefined","children":[[...spans...]]}]
+  ref_map = {}
+  desc_ref_pattern = re.compile(
+    r'([0-9a-f]+):\["\$","span",null,\{"className":"\$undefined","children":'
+    r'\[(\[.*?\])\]\}]',
+    re.DOTALL
+  )
+  for m in desc_ref_pattern.finditer(rsc_text):
+    ref_id = m.group(1)
+    children_str = m.group(2)
+    text_parts = re.findall(r'"children":"([^"]*)"', children_str)
+    full_text = "".join(text_parts).strip()
+    if full_text:
+      ref_map[ref_id] = full_text
+
+  # Find each item entry by its UPPER_CASE key in a div with __relic className
+  # The CSS module hash varies per page, so match any hash pattern
+  item_pattern = re.compile(
+    r'\["\$","div","([A-Z][A-Z0-9_\'!? ]*)",\{"className":"[^"]*__relic"'
+  )
 
   items = []
-  i = 0
-  while i < len(lines):
-    if i + 2 < len(lines) and lines[i + 1].startswith("·"):
-      name = lines[i]
-      meta = lines[i + 1].lstrip("·").strip()
-      description = lines[i + 2]
-      items.append((name, meta, description))
-      i += 3
-    else:
-      i += 1
+  seen_keys = set()
+  item_keys = [(m.group(1), m.start()) for m in item_pattern.finditer(rsc_text)]
+
+  for idx, (key, start_pos) in enumerate(item_keys):
+    # Skip duplicates (page may render items twice)
+    if key in seen_keys:
+      continue
+    seen_keys.add(key)
+
+    # Get the text slice for this item (until next item or +2000 chars)
+    end_pos = item_keys[idx + 1][1] if idx + 1 < len(item_keys) else start_pos + 2000
+    slice_text = rsc_text[start_pos:end_pos]
+
+    # Extract name from h2
+    h2_match = re.search(r'\["\$","h2",null,\{"children":"([^"]+)"\}]', slice_text)
+    if not h2_match:
+      continue
+    name = h2_match.group(1)
+
+    # Extract character and rarity from detail spans (after spacer ·)
+    detail_match = re.search(
+      r'"children":"·"\}]'
+      r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]'
+      r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]',
+      slice_text, re.DOTALL
+    )
+    character = detail_match.group(1) if detail_match else "Colorless"
+    rarity = detail_match.group(2) if detail_match else "Unknown"
+
+    # Extract description via deferred ref: "children":"$L<hex>"
+    desc_ref_match = re.search(r'description","children":"\$L([0-9a-f]+)"', slice_text)
+    description = ""
+    if desc_ref_match:
+      ref_id = desc_ref_match.group(1)
+      description = ref_map.get(ref_id, "")
+
+    items.append((name, character, rarity, description))
+
   return items
 
 def GatherSTS2Relics():
   print("\nGathering STS2 Relics...")
-  items = _sts2_parse_list_page(STS2_BASE + "/en/relics")
+  items = _sts2_parse_rsc_list(STS2_BASE + "/en/relics")
   relics = []
   seen_names = set()
-  for name, meta, description in items:
+  for name, character, rarity, description in items:
     if name in seen_names:
       continue
     seen_names.add(name)
-    category = "Colorless"
-    for char_name in ["Ironclad", "Silent", "Defect", "Necrobinder", "Regent"]:
-      if meta.startswith(char_name):
-        category = char_name
-        break
+    # Character from the RSC data is the class affinity
+    category = character if character != "Colorless" else rarity
+    # If rarity is actually a class name, fix up
+    if category in ("Common", "Uncommon", "Rare", "Starter", "Boss", "Event",
+                     "Shop", "Ancient", "Basic", "Unknown"):
+      category = character
     print("Found STS2 relic {0}".format(name))
     relics.append(Relic(name, description, category, game="STS2"))
   return relics
 
 def GatherSTS2Potions():
   print("\nGathering STS2 Potions...")
-  items = _sts2_parse_list_page(STS2_BASE + "/en/potions")
+  items = _sts2_parse_rsc_list(STS2_BASE + "/en/potions")
   potions = []
   seen_names = set()
-  for name, meta, description in items:
+  for name, character, rarity, description in items:
     if name in seen_names:
       continue
     seen_names.add(name)
-    rarity = "Common"
-    for r in ["Rare", "Uncommon", "Common"]:
-      if r in meta:
-        rarity = r
-        break
     print("Found STS2 potion {0}".format(name))
     potions.append(Potion(name, description, rarity, game="STS2"))
   return potions
