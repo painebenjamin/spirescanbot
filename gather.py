@@ -677,16 +677,28 @@ def _sts2_parse_rsc_list(url):
     r'(\[\[.*?\]\])\}\]',
     re.DOTALL
   )
+  # Walk children in document order, splicing energy icon alt text inline.
+  # Consecutive energy icons get collapsed to "N Energy" (matches STS1 style).
+  token_pattern = re.compile(r'"children":"([^"]*)"|"alt":"([^"]*Energy)"')
   for m in desc_ref_pattern.finditer(rsc_text):
     ref_id = m.group(1)
     children_str = m.group(2)
-    # Extract text from children, handling energy/star alt text
-    text_parts = re.findall(r'"children":"([^"]*)"', children_str)
-    # Also look for energy image alt texts
-    alt_parts = re.findall(r'"alt":"([^"]*Energy)"', children_str)
-    full_text = "".join(text_parts).strip()
-    if full_text:
-      ref_map[ref_id] = _unescape_html(full_text)
+    parts = []
+    for tok in token_pattern.finditer(children_str):
+      if tok.group(1) is not None:
+        parts.append(tok.group(1))
+      else:
+        parts.append('\x01E\x01')
+    text = "".join(parts)
+    # Number followed by energy icon(s): "4\x01E\x01" -> "4 Energy"
+    text = re.sub(r'(\d)\s*(\x01E\x01)+', lambda mm: mm.group(1) + ' Energy', text)
+    # Standalone energy icons: "\x01E\x01\x01E\x01" -> "2 Energy"
+    text = re.sub(r'(\x01E\x01)+',
+                  lambda mm: '{0} Energy'.format(mm.group(0).count('\x01E\x01')),
+                  text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    if text:
+      ref_map[ref_id] = _unescape_html(text)
 
   # Find each item entry by its UPPER_CASE key. The wrapping component is
   # rendered as a deferred ref ($L<hex>) rather than a literal "div", and the
