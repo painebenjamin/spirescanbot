@@ -497,7 +497,7 @@ def _sts2_extract_card_slugs():
     url = STS2_BASE + "/en/tier-list/cards/" + char
     try:
       resp = requests.get(url, timeout=15)
-      slugs = re.findall(r'/en/cards/([a-z0-9_]+)', resp.text)
+      slugs = re.findall(r'/en/cards/([a-z0-9_\-]+)', resp.text)
       for s in slugs:
         if s not in seen:
           seen.add(s)
@@ -508,7 +508,7 @@ def _sts2_extract_card_slugs():
   # Also check the main cards page for any we missed
   try:
     resp = requests.get(STS2_BASE + "/en/cards", timeout=15)
-    for s in re.findall(r'/en/cards/([a-z0-9_]+)', resp.text):
+    for s in re.findall(r'/en/cards/([a-z0-9_\-]+)', resp.text):
       if s not in seen:
         seen.add(s)
         unique.append(s)
