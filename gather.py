@@ -674,7 +674,7 @@ def _sts2_parse_rsc_list(url):
   ref_map = {}
   desc_ref_pattern = re.compile(
     r'([0-9a-f]+):\["\$","span",null,\{"className":"\$undefined","children":'
-    r'\[(\[.*?\])\]\}]',
+    r'(\[\[.*?\]\])\}\]',
     re.DOTALL
   )
   for m in desc_ref_pattern.finditer(rsc_text):
@@ -688,9 +688,11 @@ def _sts2_parse_rsc_list(url):
     if full_text:
       ref_map[ref_id] = _unescape_html(full_text)
 
-  # Find each item entry by its UPPER_CASE key in a div with __relic className
+  # Find each item entry by its UPPER_CASE key. The wrapping component is
+  # rendered as a deferred ref ($L<hex>) rather than a literal "div", and the
+  # className suffix is __relic for relics or __potion for potions.
   item_pattern = re.compile(
-    r'\["\$","div","([A-Z][A-Z0-9_\'!? ]*)",\{"className":"[^"]*__relic"'
+    r'\["\$","\$L\w+","([A-Z][A-Z0-9_\'!? ]*)",\{"className":"[^"]*__(?:relic|potion)"'
   )
 
   items = []
@@ -705,10 +707,11 @@ def _sts2_parse_rsc_list(url):
     end_pos = item_keys[idx + 1][1] if idx + 1 < len(item_keys) else start_pos + 2000
     slice_text = rsc_text[start_pos:end_pos]
 
-    h2_match = re.search(r'\["\$","h2",null,\{"children":"([^"]+)"\}]', slice_text)
-    if not h2_match:
+    # Relics use h3, potions use h2
+    h_match = re.search(r'\["\$","h[23]",null,\{"children":"([^"]+)"\}\]', slice_text)
+    if not h_match:
       continue
-    item_name = _unescape_html(h2_match.group(1))
+    item_name = _unescape_html(h_match.group(1))
 
     detail_match = re.search(
       r'"children":"\xb7"\}]'
