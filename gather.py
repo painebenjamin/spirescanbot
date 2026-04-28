@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Gather Slay the Spire 1 & 2 data from slaythespire.wiki.gg.
+
+Both games' content is stored as Lua return-table modules accessible through
+MediaWiki's parse API. We fetch the wikitext for each module, parse the table,
+and render each entry's text into the upgrade-diff display style used by the
+Reddit bot (e.g. "Deal 6(9) damage.").
+"""
 import requests
-import json
 import os
 import re
 import time
@@ -9,13 +15,12 @@ import yaml
 import html as html_module
 from difflib import SequenceMatcher
 
-# --- STS1 sources (MediaWiki API — Cloudflare blocks HTML scraping now) ---
-STS1_API = "https://slay-the-spire.fandom.com/api.php"
+WIKI_API = "https://slaythespire.wiki.gg/api.php"
 
-# --- STS2 sources ---
-STS2_BASE = "https://sts2.untapped.gg"
 
-# --- Data classes ---
+# =========================================================================
+# Data classes
+# =========================================================================
 
 class SpireObject(object):
   def __repr__(self):
@@ -61,329 +66,455 @@ class Event(SpireObject):
 
 
 # =========================================================================
-# Wikitext parsing helpers
+# MediaWiki fetch
 # =========================================================================
 
-def _clean_wikitext(text):
-  """Strip wikitext markup to plain text."""
-  # Remove {{KW|...}} and {{C|...}} templates -> just the first arg
-  text = re.sub(r'\{\{KW\|([^}|]+)(?:\|[^}]*)?\}\}', r'\1', text)
-  text = re.sub(r'\{\{C\|([^}|]+)(?:\|[^}]*)?\}\}', r'\1', text)
-  # Remove other templates
-  text = re.sub(r'\{\{[^}]*\}\}', '', text)
-  # Remove [[File:...]]
-  text = re.sub(r'\[\[File:[^\]]*\]\]', '', text)
-  # Convert [[Page|Display]] -> Display, [[Page]] -> Page
-  text = re.sub(r'\[\[([^]|]*)\|([^\]]*)\]\]', r'\2', text)
-  text = re.sub(r'\[\[([^\]]*)\]\]', r'\1', text)
-  # Remove bold/italic markup
-  text = re.sub(r"'{2,5}", '', text)
-  # Remove any remaining HTML tags
-  text = re.sub(r'<[^>]+>', '', text)
-  # Clean up whitespace
-  text = re.sub(r'\s+', ' ', text).strip()
+_HEADERS = {"User-Agent": "SpireScanBot/2.0 (+https://github.com/ehmohteeoh/spirescanbot)"}
+
+def _get_module_wikitext(page, max_retries=3):
+  """Fetch the raw wikitext for a Module: page via the MediaWiki parse API."""
+  delay = 1.0
+  for attempt in range(max_retries):
+    resp = requests.get(WIKI_API, params={
+      "action": "parse",
+      "page": page,
+      "prop": "wikitext",
+      "format": "json",
+    }, headers=_HEADERS, timeout=20)
+    if resp.status_code == 429:
+      time.sleep(delay)
+      delay *= 2
+      continue
+    resp.raise_for_status()
+    time.sleep(0.3)
+    return resp.json()["parse"]["wikitext"]["*"]
+  resp.raise_for_status()
+  return resp.json()["parse"]["wikitext"]["*"]
+
+
+# =========================================================================
+# Lua return-table parser
+# =========================================================================
+
+_LUA_STRING_ESCAPES = {
+  "n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'", "\\": "\\",
+}
+
+def _strip_lua_comments(text):
+  """Remove Lua line comments (-- ...) but only outside string literals."""
+  out = []
+  i = 0
+  n = len(text)
+  while i < n:
+    ch = text[i]
+    if ch == '"':
+      j = i + 1
+      while j < n and text[j] != '"':
+        if text[j] == '\\' and j + 1 < n:
+          j += 2
+        else:
+          j += 1
+      out.append(text[i:j + 1])
+      i = j + 1
+    elif ch == '-' and i + 1 < n and text[i + 1] == '-':
+      while i < n and text[i] != '\n':
+        i += 1
+    else:
+      out.append(ch)
+      i += 1
+  return "".join(out)
+
+
+def _read_lua_string(text, i):
+  """Read a Lua double-quoted string starting at text[i] == '"'.
+
+  Returns (decoded_value, index_after_closing_quote).
+  """
+  assert text[i] == '"'
+  i += 1
+  out = []
+  n = len(text)
+  while i < n:
+    ch = text[i]
+    if ch == '"':
+      return "".join(out), i + 1
+    if ch == '\\' and i + 1 < n:
+      nxt = text[i + 1]
+      if nxt in _LUA_STRING_ESCAPES:
+        out.append(_LUA_STRING_ESCAPES[nxt])
+        i += 2
+        continue
+      if nxt == 'u' and i + 2 < n and text[i + 2] == '{':
+        end = text.find('}', i + 3)
+        if end != -1:
+          try:
+            out.append(chr(int(text[i + 3:end], 16)))
+            i = end + 1
+            continue
+          except ValueError:
+            pass
+      out.append(nxt)
+      i += 2
+    else:
+      out.append(ch)
+      i += 1
+  return "".join(out), i
+
+
+def _read_lua_value(text, i):
+  """Read a Lua value (string, number, bool, nil, or { ... }) at text[i].
+
+  Returns (value, index_after_value). For tables we capture the raw inner
+  text, since we never need to deeply traverse Traits/Requirement/etc.
+  """
+  n = len(text)
+  while i < n and text[i] in " \t\r\n":
+    i += 1
+  if i >= n:
+    return None, i
+
+  ch = text[i]
+  if ch == '"':
+    return _read_lua_string(text, i)
+  if ch == '{':
+    depth = 1
+    j = i + 1
+    while j < n and depth > 0:
+      cj = text[j]
+      if cj == '"':
+        _, j = _read_lua_string(text, j)
+        continue
+      if cj == '{':
+        depth += 1
+      elif cj == '}':
+        depth -= 1
+      j += 1
+    inner = text[i + 1:j - 1]
+    return {"__raw__": inner}, j
+  m = re.match(r'(-?\d+(?:\.\d+)?)', text[i:])
+  if m:
+    raw = m.group(1)
+    try:
+      val = int(raw)
+    except ValueError:
+      val = float(raw)
+    return val, i + len(raw)
+  m = re.match(r'(true|false|nil)\b', text[i:])
+  if m:
+    raw = m.group(1)
+    val = {"true": True, "false": False, "nil": None}[raw]
+    return val, i + len(raw)
+  return None, i + 1
+
+
+def _parse_lua_object_body(body):
+  """Parse the inner body of a Lua table literal into a dict of fields."""
+  result = {}
+  i = 0
+  n = len(body)
+  while i < n:
+    while i < n and body[i] in " \t\r\n,;":
+      i += 1
+    if i >= n:
+      break
+
+    if body[i] == '[':
+      end = body.find(']', i)
+      if end == -1:
+        break
+      key_expr = body[i + 1:end].strip()
+      if key_expr.startswith('"') and key_expr.endswith('"'):
+        key, _ = _read_lua_string(key_expr, 0)
+      else:
+        key = key_expr
+      i = end + 1
+    else:
+      m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)', body[i:])
+      if not m:
+        i += 1
+        continue
+      key = m.group(1)
+      i += len(key)
+
+    while i < n and body[i] in " \t\r\n":
+      i += 1
+    if i >= n or body[i] != '=':
+      continue
+    i += 1
+    value, i = _read_lua_value(body, i)
+    result[key] = value
+
+  return result
+
+
+def _parse_lua_table(text):
+  """Parse a Lua return-table module into a dict of {name: {field: value}}.
+
+  Top-level entries are expected to be of the form `["Name"] = { ... }`.
+  Returns an ordered dict-like list-preserving dict.
+  """
+  text = _strip_lua_comments(text)
+  m = re.search(r'\breturn\s*\{', text)
+  if not m:
+    return {}
+  start = m.end()
+  depth = 1
+  i = start
+  n = len(text)
+  while i < n and depth > 0:
+    ch = text[i]
+    if ch == '"':
+      _, i = _read_lua_string(text, i)
+      continue
+    if ch == '{':
+      depth += 1
+    elif ch == '}':
+      depth -= 1
+      if depth == 0:
+        break
+    i += 1
+  body = text[start:i]
+
+  entries = {}
+  j = 0
+  m_len = len(body)
+  while j < m_len:
+    while j < m_len and body[j] in " \t\r\n,;":
+      j += 1
+    if j >= m_len:
+      break
+    if body[j] != '[':
+      j += 1
+      continue
+    end = body.find(']', j)
+    if end == -1:
+      break
+    key_expr = body[j + 1:end].strip()
+    if key_expr.startswith('"'):
+      key, _ = _read_lua_string(key_expr, 0)
+    else:
+      key = key_expr
+    k = end + 1
+    while k < m_len and body[k] in " \t\r\n":
+      k += 1
+    if k >= m_len or body[k] != '=':
+      j = end + 1
+      continue
+    k += 1
+    value, k = _read_lua_value(body, k)
+    if isinstance(value, dict) and "__raw__" in value:
+      entries[key] = _parse_lua_object_body(value["__raw__"])
+    else:
+      entries[key] = value
+    j = k
+
+  return entries
+
+
+# =========================================================================
+# Wiki text -> display text rendering
+# =========================================================================
+
+def _strip_templates(text):
+  """Replace MediaWiki templates with reasonable display text.
+
+  - {{C|X}} / {{C|X|Y}} / {{C|X|Y|2}} -> last non-empty (and non-numeric) arg
+  - {{R|Name||2}}                     -> Name
+  - {{KW|kw|Display|2}}               -> Display (or kw if no display)
+  - {{QueryLink|page|filter|Display}} -> Display
+  - any other {{...}}                 -> stripped
+  """
+  def _resolve(args):
+    """Return the most readable arg from a template's pipe-split args."""
+    cleaned = [a.strip() for a in args]
+    while cleaned and (not cleaned[-1] or cleaned[-1].isdigit()):
+      cleaned.pop()
+    return cleaned[-1] if cleaned else ""
+
+  def _replace(match):
+    inner = match.group(1)
+    parts = inner.split('|')
+    name = parts[0].strip()
+    args = parts[1:]
+    if name in ("C", "R", "KW"):
+      return _resolve(args) or name
+    if name == "QueryLink":
+      return _resolve(args)
+    return ""
+
+  for _ in range(5):
+    new_text = re.sub(r'\{\{([^{}]*)\}\}', _replace, text)
+    if new_text == text:
+      break
+    text = new_text
   return text
 
-def _get_wikitext(page):
-  """Fetch wikitext for a page from the Fandom MediaWiki API."""
-  resp = requests.get(STS1_API, params={
-    "action": "parse",
-    "page": page,
-    "prop": "wikitext",
-    "format": "json",
-  }, timeout=15)
-  resp.raise_for_status()
-  data = resp.json()
-  return data["parse"]["wikitext"]["*"]
 
-def _parse_wiki_table_rows(wikitext):
-  """Parse rows from a wikitext table.
+def _replace_keyword_dollar(text):
+  """Replace $Keyword references with plain text.
 
-  Yields lists of cell values (cleaned) for each row.
-  Rows start with |- and cells start with |.
-  Multi-line cells (continuation lines) are appended to the last cell.
+  Keywords are TitleCase words, optionally a second TitleCase word
+  (e.g. $Lock On, $Plated Armor).
   """
-  in_table = False
-  current_row = []
-  # Track raw (uncleaned) cell parts so multi-line cells are joined before cleaning
-  raw_cells = []
-
-  def _finish_row():
-    """Clean accumulated raw cells and return as a row."""
-    return [_clean_wikitext(cell) for cell in raw_cells]
-
-  for line in wikitext.split("\n"):
-    stripped = line.strip()
-    if stripped.startswith("{|"):
-      in_table = True
-      continue
-    if stripped.startswith("|}"):
-      if raw_cells:
-        yield _finish_row()
-      in_table = False
-      raw_cells = []
-      continue
-    if not in_table:
-      continue
-    if stripped.startswith("!"):
-      continue  # Header row
-    if stripped.startswith("|-"):
-      if raw_cells:
-        yield _finish_row()
-      raw_cells = []
-      continue
-    if stripped.startswith("|"):
-      cell = stripped[1:].strip()
-      raw_cells.append(cell)
-    elif raw_cells and stripped:
-      # Continuation of the previous cell (multi-line description)
-      raw_cells[-1] += " " + stripped
-
-  if raw_cells:
-    yield _finish_row()
+  return re.sub(
+    r'\$([A-Z][A-Za-z]*)((?:\s+[A-Z][A-Za-z]*)?)',
+    lambda m: m.group(1) + m.group(2),
+    text,
+  )
 
 
-# =========================================================================
-# STS1 Gathering (via MediaWiki API)
-# =========================================================================
-
-def GatherCards():
-  card_pages = {
-    "Ironclad": "Ironclad_Cards",
-    "Silent": "Silent_Cards",
-    "Defect": "Defect_Cards",
-    "Watcher": "Watcher_Cards",
-    "Colorless": "Colorless_Cards",
-    "Status": "Status",
-    "Curse": "Curse",
-  }
-
-  cards = []
-
-  for category, page in card_pages.items():
-    print("Gathering STS1 {0}".format(category))
-    try:
-      wikitext = _get_wikitext(page)
-    except Exception as e:
-      print("  Failed to fetch {0}: {1}".format(page, e))
-      continue
-
-    for row in _parse_wiki_table_rows(wikitext):
-      if category == "Status":
-        if len(row) >= 4:
-          name, _, card_type, description = row[0], row[1], row[2], row[3]
-          print("Found STS1 card {0}".format(name))
-          cards.append(Card(name, description, card_type, category, None, None, game="STS1"))
-
-      elif category == "Curse":
-        if len(row) >= 3:
-          name = row[0]
-          description = row[2] if len(row) >= 3 else row[-1]
-          print("Found STS1 card {0}".format(name))
-          cards.append(Card(name, description, "Curse", category, None, None, game="STS1"))
-
-      elif len(row) >= 6:
-        # Standard card: Name, Picture, Rarity, Type, Energy, Description
-        name, _, rarity, card_type, energy, description = row[0], row[1], row[2], row[3], row[4], row[5]
-        print("Found STS1 card {0}".format(name))
-        cards.append(Card(name, description, card_type, category, rarity, energy, game="STS1"))
-
-  return cards
-
-def GatherRelics():
-  relics = []
-  print("Gathering STS1 Relics")
-  try:
-    wikitext = _get_wikitext("Relics")
-  except Exception as e:
-    print("  Failed to fetch Relics: {0}".format(e))
-    return relics
-
-  for row in _parse_wiki_table_rows(wikitext):
-    if len(row) >= 4:
-      _, name, category, description = row[0], row[1], row[2], row[3]
-      # Skip junk rows (CSS style strings parsed as data)
-      if name.startswith("style=") or "border" in name or len(name) > 100:
-        continue
-      print("Found STS1 relic {0}".format(name))
-      relics.append(Relic(name, description, category, game="STS1"))
-
-  return relics
-
-def GatherPotions():
-  potions = []
-  print("Gathering STS1 Potions")
-  try:
-    wikitext = _get_wikitext("Potions")
-  except Exception as e:
-    print("  Failed to fetch Potions: {0}".format(e))
-    return potions
-
-  for row in _parse_wiki_table_rows(wikitext):
-    if len(row) >= 4:
-      _, name, rarity, description = row[0], row[1], row[2], row[3]
-      print("Found STS1 potion {0}".format(name))
-      potions.append(Potion(name, description, rarity, game="STS1"))
-
-  return potions
-
-def _get_event_description(event_name):
-  """Fetch an event's description from its wiki page via API."""
-  page_title = event_name.replace(" ", "_")
-  try:
-    wikitext = _get_wikitext(page_title)
-  except Exception:
-    try:
-      wikitext = _get_wikitext(page_title + "_(Event)")
-    except Exception:
-      return ""
-
-  lines = wikitext.split("\n")
-  for line in lines:
-    line = line.strip()
-    if not line or line.startswith("[[File:") or line.startswith("[[Category"):
-      continue
-    if line.startswith("{") or line.startswith("=") or line.startswith("__"):
-      continue
-    if line.startswith("*") or line.startswith("#") or line.startswith("|") or line.startswith("!"):
-      continue
-    cleaned = _clean_wikitext(line)
-    if len(cleaned) > 20:
-      return cleaned
-
-  return ""
-
-def GatherEvents():
-  """Gather STS1 events from the Events wiki page."""
-  events = []
-  print("Gathering STS1 Events")
-
-  events_json = os.path.join(os.path.dirname(__file__), "events.json")
-  if os.path.exists(events_json):
-    data = json.loads(open(events_json, "r").read())
-    for act in data:
-      for name in data[act]:
-        print("Found STS1 event {0} (from events.json)".format(name))
-        events.append(Event(name, data[act][name], act, game="STS1"))
-    if events:
-      return events
-
-  try:
-    wikitext = _get_wikitext("Events")
-  except Exception as e:
-    print("  Failed to fetch Events: {0}".format(e))
-    return events
-
-  section_map = {
-    "common_events": "Common",
-    "act1_events": "Act 1 (The Exordium)",
-    "act2_events": "Act 2 (The City)",
-    "act3_events": "Act 3 (The Beyond)",
-  }
-
-  sections = re.split(r'<div id="(\w+_events)"', wikitext)
-
-  for i in range(1, len(sections), 2):
-    section_id = sections[i]
-    section_text = sections[i + 1] if i + 1 < len(sections) else ""
-    act_name = section_map.get(section_id, section_id)
-
-    names = re.findall(r'\{\{ficon\|[^|]+\|([^|]+)\|', section_text)
-    link_names = re.findall(r'\[\[([^|\]]+?)(?:\s*\(Event\))?\|([^\]]+)\]\]', section_text)
-    for page, display in link_names:
-      if display not in names and "Act" not in display and "File:" not in display:
-        names.append(display)
-
-    for name in names:
-      if len(name) < 3 or "|" in name or "px" in name or name in ["first", "three", "two"]:
-        continue
-      print("Found STS1 event {0} ({1})".format(name, act_name))
-      description = _get_event_description(name)
-      events.append(Event(name, description, act_name, game="STS1"))
-      time.sleep(0.2)
-
-  return events
+# All character/colorless energy icon codes used across both games.
+_ENERGY_TOKEN_RE = re.compile(
+  r'@(RE|GE|BE|PE|IE|SE|DE|NE|CE|RegE)'
+)
+_STAR_TOKEN_RE = re.compile(r'@ST')
 
 
-# =========================================================================
-# STS2 HTML parsing helpers
-# =========================================================================
-
-def _unescape_html(text):
-  """Unescape HTML entities: &#x27; -> ', &amp; -> &, etc."""
-  return html_module.unescape(text)
-
-def _extract_description_from_html(html_fragment):
-  """Extract card description text from an HTML fragment (foreignObject content).
-
-  Handles:
-  - <img alt="Regent Star Energy"> -> star marker (counted)
-  - <img alt="X Energy"> -> energy marker (counted)
-  - <span class="...mechanic">keyword</span> -> keyword text
-  - <br/> -> sentence separator
-  """
-  # Replace star energy images with placeholder
-  text = re.sub(r'<img[^>]*alt="[^"]*Star Energy"[^>]*/?\s*>', '\x01S\x01', html_fragment)
-  # Replace regular energy images with placeholder
-  text = re.sub(r'<img[^>]*alt="[^"]*Energy"[^>]*/?\s*>', '\x01E\x01', text)
-  # Replace <br/> with sentence separator
-  text = re.sub(r'<br\s*/?>', ' ', text)
-  # Strip all remaining HTML tags
-  text = re.sub(r'<[^>]+>', '', text)
-  # Unescape HTML entities
-  text = _unescape_html(text)
-  # Clean up whitespace
-  text = re.sub(r'\s+', ' ', text).strip()
-
-  # Normalize energy/star sequences:
-  # 1. Number followed by energy icon(s) (with optional space): "4\x01E\x01" -> "4 Energy"
-  def _replace_numbered_energy(m):
-    return m.group(1) + ' Energy'
-  text = re.sub(r'(\d)\s*(\x01E\x01)+', _replace_numbered_energy, text)
-
-  # 2. Standalone energy icons: "\x01E\x01\x01E\x01" -> "2 Energy"
-  def _replace_energy(m):
-    count = m.group(0).count('\x01E\x01')
-    return '{0} Energy'.format(count)
-  text = re.sub(r'(\x01E\x01)+', _replace_energy, text)
-
-  # 3. Number followed by star icon(s) (with optional space)
-  def _replace_numbered_stars(m):
-    return m.group(1) + ' Stars'
-  text = re.sub(r'(\d)\s*(\x01S\x01)+', _replace_numbered_stars, text)
-
-  # 4. Standalone star icons: "\x01S\x01\x01S\x01\x01S\x01" -> "3 Stars"
-  def _replace_stars(m):
-    count = m.group(0).count('\x01S\x01')
-    return '{0} Stars'.format(count)
-  text = re.sub(r'(\x01S\x01)+', _replace_stars, text)
-
-  # Fix missing spaces where word runs into number: "Gain3" -> "Gain 3"
-  text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
-  # Fix stray spaces before punctuation: "something ." -> "something."
-  text = re.sub(r'\s+([.,;:!?])', r'\1', text)
-  # Clean up multiple spaces
-  text = re.sub(r'\s+', ' ', text)
-
-  return text.strip()
-
-def _compute_upgrade_diff(base_text, upgrade_text):
-  """Compute a parenthesized diff between base and upgraded card text.
+def _collapse_energy_and_stars(text):
+  """Convert sequences of energy/star icons into "N Energy" / "N Stars".
 
   Examples:
-    "Deal 6 damage." + "Deal 9 damage." -> "Deal 6(9) damage."
-    "Gain 2 Stars." + "Gain 3 Stars." -> "Gain 2(3) Stars."
-    "Draw 1 card." + "Draw 2 cards." -> "Draw 1(2) card(s)."
+    "Gain @RE @RE."          -> "Gain 2 Energy."
+    "Costs 1 less @BE for"   -> "Costs 1 less Energy for"   (single = 1 Energy collapsed)
+    "Gain @ST@ST@ST."        -> "Gain 3 Stars."
   """
+  marker_e = '\x01E\x01'
+  marker_s = '\x01S\x01'
+  text = _ENERGY_TOKEN_RE.sub(marker_e, text)
+  text = _STAR_TOKEN_RE.sub(marker_s, text)
+
+  def _repl_numbered_energy(m):
+    return m.group(1) + ' Energy'
+  text = re.sub(r'(\d)\s*' + marker_e + r'(?:\s*' + marker_e + r')*',
+                _repl_numbered_energy, text)
+
+  def _repl_energy(m):
+    n = m.group(0).count(marker_e)
+    return ('Energy' if n == 1 else '{0} Energy'.format(n))
+  text = re.sub(marker_e + r'(?:\s*' + marker_e + r')*', _repl_energy, text)
+
+  def _repl_numbered_stars(m):
+    return m.group(1) + ' Stars'
+  text = re.sub(r'(\d)\s*' + marker_s + r'(?:\s*' + marker_s + r')*',
+                _repl_numbered_stars, text)
+
+  def _repl_stars(m):
+    n = m.group(0).count(marker_s)
+    return ('1 Star' if n == 1 else '{0} Stars'.format(n))
+  text = re.sub(marker_s + r'(?:\s*' + marker_s + r')*', _repl_stars, text)
+
+  # Remaining @-prefixed icon tokens (e.g. @Gold) -> the bare word.
+  text = re.sub(r'@([A-Z][A-Za-z]*)', r'\1', text)
+
+  return text
+
+
+def _expand_upgrade_brackets(text, opener, closer, separator):
+  """Expand inline upgrade brackets into base/upgrade text pairs.
+
+  STS1 cards / STS2 cards use [base|upgrade].
+  STS1 potions use <base:upgrade>.
+
+  We walk left-to-right collecting two parallel strings (base, upgraded).
+  """
+  base = []
+  upg = []
+  i = 0
+  n = len(text)
+  while i < n:
+    ch = text[i]
+    if ch == opener:
+      end = text.find(closer, i + 1)
+      if end == -1:
+        base.append(ch)
+        upg.append(ch)
+        i += 1
+        continue
+      inside = text[i + 1:end]
+      sep_pos = inside.find(separator)
+      if sep_pos == -1:
+        base.append(opener + inside + closer)
+        upg.append(opener + inside + closer)
+      else:
+        b = inside[:sep_pos]
+        u = inside[sep_pos + 1:]
+        # When one side is empty, add a separating space so it doesn't
+        # collide with adjacent words from outside the bracket
+        # (e.g. "add<:two copies>" should expand to "add" / "add two copies").
+        if not b and u:
+          u = ' ' + u
+        if not u and b:
+          b = ' ' + b
+        base.append(b)
+        upg.append(u)
+      i = end + 1
+    else:
+      base.append(ch)
+      upg.append(ch)
+      i += 1
+  return "".join(base), "".join(upg)
+
+
+def _normalize_whitespace(text):
+  text = html_module.unescape(text)
+  text = re.sub(r'<br\s*/?>', ' ', text, flags=re.IGNORECASE)
+  text = re.sub(r'<[^>]+>', ' ', text)
+  text = re.sub(r'\s+([.,;:!?])', r'\1', text)
+  text = re.sub(r'\s+', ' ', text)
+  return text.strip()
+
+
+_WIKILINK_RE = re.compile(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
+
+def _strip_wikilinks(text):
+  """Replace [[Page|Display]] -> Display, [[Page]] -> Page."""
+  return _WIKILINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+
+
+def _render_text(raw, upgrade_syntax="square"):
+  """Render a wiki-formatted card/relic/potion/event description string.
+
+  upgrade_syntax: "square" for [base|upgrade], "angle" for <base:upgrade>,
+  or "none" to skip upgrade expansion entirely.
+  """
+  if not raw:
+    return ""
+  raw = _strip_wikilinks(raw)
+  if upgrade_syntax == "square":
+    base_raw, upg_raw = _expand_upgrade_brackets(raw, '[', ']', '|')
+  elif upgrade_syntax == "angle":
+    base_raw, upg_raw = _expand_upgrade_brackets(raw, '<', '>', ':')
+  else:
+    base_raw = raw
+    upg_raw = raw
+
+  def _post(s):
+    s = _strip_templates(s)
+    s = _replace_keyword_dollar(s)
+    s = _collapse_energy_and_stars(s)
+    s = _normalize_whitespace(s)
+    return s
+
+  base = _post(base_raw)
+  upg = _post(upg_raw)
+  if upgrade_syntax == "none" or base == upg:
+    return base
+  return _compute_upgrade_diff(base, upg)
+
+
+# =========================================================================
+# Upgrade diff (base text vs upgraded text)
+# =========================================================================
+
+def _compute_upgrade_diff(base_text, upgrade_text):
+  """Compute a parenthesized diff between base and upgraded card text."""
   if not base_text or not upgrade_text:
-    return base_text or ""
+    return base_text or upgrade_text or ""
   if base_text == upgrade_text:
     return base_text
 
   base_words = base_text.split()
   upg_words = upgrade_text.split()
-
-  # Use SequenceMatcher for alignment
   matcher = SequenceMatcher(None, base_words, upg_words)
   result = []
 
@@ -394,22 +525,18 @@ def _compute_upgrade_diff(base_text, upgrade_text):
       base_chunk = base_words[i1:i2]
       upg_chunk = upg_words[j1:j2]
       if len(base_chunk) == len(upg_chunk):
-        # Word-by-word replacement
         for bw, uw in zip(base_chunk, upg_chunk):
           result.append(_diff_word(bw, uw))
       elif len(base_chunk) == 1 and len(upg_chunk) == 1:
         result.append(_diff_word(base_chunk[0], upg_chunk[0]))
       else:
-        # Multi-word replacement — show inline
         result.append('{0}({1})'.format(
           ' '.join(base_chunk), ' '.join(upg_chunk)
         ))
     elif op == 'insert':
-      # Words added in upgrade
       added = ' '.join(upg_words[j1:j2])
       result.append('({0})'.format(added))
     elif op == 'delete':
-      # Words removed in upgrade — show with strikethrough notation
       removed = ' '.join(base_words[i1:i2])
       result.append(removed)
 
@@ -421,32 +548,25 @@ def _diff_word(base_word, upg_word):
   if base_word == upg_word:
     return base_word
 
-  # Strip trailing punctuation for comparison
   base_stripped = base_word.rstrip('.,;:!?')
   upg_stripped = upg_word.rstrip('.,;:!?')
   base_punct = base_word[len(base_stripped):]
   upg_punct = upg_word[len(upg_stripped):]
-  # Use base punctuation (usually same)
   punct = base_punct or upg_punct
 
   if base_stripped == upg_stripped:
-    return base_word  # Only punctuation differs
+    return base_word
 
-  # Check if both are numbers
   if _is_number(base_stripped) and _is_number(upg_stripped):
     return '{0}({1}){2}'.format(base_stripped, upg_stripped, punct)
 
-  # Check pluralization: "card" -> "cards", "time" -> "times"
   if upg_stripped == base_stripped + 's' or upg_stripped == base_stripped + 'es':
     return base_stripped + '(s)' + punct
 
-  # Check "a" -> "ALL", "random" -> "not random" etc.
-  # For simple word changes, parenthesize
   return '{0}({1}){2}'.format(base_stripped, upg_stripped, punct)
 
 
 def _is_number(s):
-  """Check if string is a number (int or X for variable cost)."""
   try:
     int(s)
     return True
@@ -454,333 +574,243 @@ def _is_number(s):
     return s == 'X'
 
 
-def _extract_upgrade_cost(page_html):
-  """Extract upgrade cost change from the upgradeDetails section.
+# =========================================================================
+# Cost rendering
+# =========================================================================
 
-  Returns (base_cost, upgrade_cost) if cost changes, else (None, None).
-  Pattern: "Cost changes from 3 to 2"
+def _format_cost(cost, cost_plus=None):
+  """Return display string for a cost, or None for unplayable.
+
+  Cost == -2 -> Unplayable (None)
+  Cost == -1 -> X
+  Otherwise int. CostPlus, if different, is rendered as "a(b)".
   """
-  upg_match = re.search(
-    r'upgradeDetails[^>]*>(.*?)</div>\s*</div>\s*</div>',
-    page_html, re.DOTALL
-  )
-  if not upg_match:
-    return None, None
-
-  raw = upg_match.group(1)
-  # Strip tags
-  text = re.sub(r'<[^>]+>', ' ', raw)
-  text = re.sub(r'\s+', ' ', text).strip()
-
-  cost_match = re.search(r'Cost changes from (\d+) to (\d+)', text)
-  if cost_match:
-    return cost_match.group(1), cost_match.group(2)
-
-  return None, None
+  if cost is None or cost == -2:
+    return None
+  if cost == -1:
+    base = "X"
+  else:
+    base = str(cost)
+  if cost_plus is not None and cost_plus != cost:
+    if cost_plus == -1:
+      upg = "X"
+    elif cost_plus == -2:
+      upg = "Unplayable"
+    else:
+      upg = str(cost_plus)
+    return "{0}({1})".format(base, upg)
+  return base
 
 
 # =========================================================================
-# STS2 Gathering (from sts2.untapped.gg)
+# STS1 gathering (Module:Cards/data, Module:Relics/data, etc.)
 # =========================================================================
 
-def _sts2_extract_card_slugs():
-  """Extract all card slugs from STS2 per-character card pages.
+_STS1_COLOR_TO_CATEGORY = {
+  "Red": "Ironclad",
+  "Green": "Silent",
+  "Blue": "Defect",
+  "Purple": "Watcher",
+  "Colorless": "Colorless",
+}
 
-  The main /en/cards page only loads ~90 slugs (JS lazy-loads the rest).
-  Per-character pages have all slugs for that character in the HTML.
-  """
-  characters = ["ironclad", "silent", "defect", "necrobinder", "regent", "colorless"]
-  seen = set()
-  unique = []
-
-  for char in characters:
-    url = STS2_BASE + "/en/tier-list/cards/" + char
-    try:
-      resp = requests.get(url, timeout=15)
-      slugs = re.findall(r'/en/cards/([a-z0-9_\-]+)', resp.text)
-      for s in slugs:
-        if s not in seen:
-          seen.add(s)
-          unique.append(s)
-    except Exception as e:
-      print("  Failed to fetch {0} cards: {1}".format(char, e))
-
-  # Also check the main cards page for any we missed
-  try:
-    resp = requests.get(STS2_BASE + "/en/cards", timeout=15)
-    for s in re.findall(r'/en/cards/([a-z0-9_\-]+)', resp.text):
-      if s not in seen:
-        seen.add(s)
-        unique.append(s)
-  except Exception:
-    pass
-
-  return unique
-
-def _sts2_parse_card_page(slug):
-  """Fetch and parse a single STS2 card page.
-
-  Uses:
-  - Meta tags for structured data (name, category, rarity, type, cost)
-  - foreignObject elements for accurate base + upgrade descriptions
-  - starCost SVG for Regent star costs
-  - upgradeDetails for cost-only upgrades
-  """
-  url = STS2_BASE + "/en/cards/" + slug
-  try:
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-  except Exception as e:
-    print("  Failed to fetch card {0}: {1}".format(slug, e))
-    return None
-
-  page_html = resp.text
-
-  # --- Parse structured info from meta tags ---
-  title_match = re.search(r'<title>([^<]+)</title>', page_html)
-  if not title_match:
-    return None
-  title = title_match.group(1).strip()
-  title = _unescape_html(title)
-  title = re.sub(r'\s*[\u2013-]\s*Untapped\.gg\s*$', '', title)
-  title = re.sub(r'\s*[\u2013-]\s*Slay the Spire 2\s*$', '', title)
-
-  parts = title.split(" - ", 1)
-  name = parts[0].strip()
-
-  desc_match = re.search(
-    r'<meta[^>]*name="description"[^>]*content="([^"]+)"', page_html
-  )
-  if not desc_match:
-    desc_match = re.search(
-      r'<meta[^>]*property="og:description"[^>]*content="([^"]+)"', page_html
-    )
-
-  cost = None
-  rarity = None
-  card_type = None
-  category = None
-
-  if desc_match:
-    meta_desc = _unescape_html(desc_match.group(1))
-    # Handle X-Cost cards: "X-Cost" in meta
-    info_match = re.match(
-      r'.+? is an? ([\dX]+)-Cost\s+(?:(Common|Uncommon|Rare|Basic)\s+)?'
-      r'(Attack|Skill|Power|Status|Curse)\s+card in the (\w+) pool:\s*(.+)',
-      meta_desc
-    )
-    if info_match:
-      cost = info_match.group(1)
-      rarity = info_match.group(2) or "Basic"
-      card_type = info_match.group(3)
-      category = info_match.group(4)
-
-  # Fallback category/rarity from title parts
-  if len(parts) > 1 and (not category or not rarity):
-    info = parts[1].strip()
-    tokens = info.split()
-    if not category and tokens:
-      category = tokens[0]
-    for t in tokens:
-      if t in ("Common", "Uncommon", "Rare", "Basic") and not rarity:
-        rarity = t
-      if t in ("Attack", "Skill", "Power", "Status", "Curse") and not card_type:
-        card_type = t
-
-  # --- Parse descriptions from foreignObject elements ---
-  # First foreignObject = base card, second = upgraded card (in display:none div)
-  foreign_objects = re.findall(
-    r'<foreignObject[^>]*>(.*?)</foreignObject>',
-    page_html, re.DOTALL
-  )
-
-  base_desc = ""
-  upgrade_desc = ""
-
-  if len(foreign_objects) >= 1:
-    base_desc = _extract_description_from_html(foreign_objects[0])
-  if len(foreign_objects) >= 2:
-    upgrade_desc = _extract_description_from_html(foreign_objects[1])
-
-  # --- Parse star cost from SVG (only from the main card, not OTHER CARDS) ---
-  star_cost = None
-  # The main card is before the "otherCards" or "upgradeDetails" sections
-  # Find the first starCost SVG that appears before the OTHER CARDS section
-  other_cards_pos = page_html.find('otherCards')
-  search_region = page_html[:other_cards_pos] if other_cards_pos > 0 else page_html
-  star_match = re.search(
-    r'starCost[^>]*>.*?<text[^>]*>(\d+)</text>',
-    search_region, re.DOTALL
-  )
-  if star_match:
-    star_cost = star_match.group(1)
-
-  # --- Compute upgrade diff ---
-  description = base_desc
-  if upgrade_desc and upgrade_desc != base_desc:
-    description = _compute_upgrade_diff(base_desc, upgrade_desc)
-
-  # --- Check for cost-only upgrades ---
-  old_cost, new_cost = _extract_upgrade_cost(page_html)
-  if old_cost and new_cost and old_cost != new_cost:
-    cost = '{0}({1})'.format(old_cost, new_cost)
-
-  # Unescape name
-  name = _unescape_html(name)
-
-  return Card(
-    name=name,
-    description=description,
-    card_type=card_type or "Unknown",
-    category=category or "Unknown",
-    rarity=rarity or "Basic",
-    cost=cost,
-    game="STS2",
-    star_cost=star_cost,
-  )
-
-def GatherSTS2Cards():
-  print("\nGathering STS2 Cards...")
-  slugs = _sts2_extract_card_slugs()
-  print("Found {0} card slugs".format(len(slugs)))
-
+def GatherCards():
+  print("Gathering STS1 Cards")
   cards = []
-  for i, slug in enumerate(slugs):
-    card = _sts2_parse_card_page(slug)
-    if card:
-      print("Found STS2 card {0} ({1}/{2})".format(card.name, i + 1, len(slugs)))
-      cards.append(card)
-    if (i + 1) % 10 == 0:
-      time.sleep(0.5)
+  try:
+    wikitext = _get_module_wikitext("Module:Cards/data")
+  except Exception as e:
+    print("  Failed: {0}".format(e))
+    return cards
 
+  for name, data in _parse_lua_table(wikitext).items():
+    if name == "nodata_fallback":
+      continue
+    color = data.get("Color", "Colorless")
+    card_type = data.get("Type", "Skill")
+    rarity = data.get("Rarity", "Basic")
+    category = _STS1_COLOR_TO_CATEGORY.get(color, color)
+    if card_type in ("Status", "Curse"):
+      category = card_type
+    cost = _format_cost(data.get("Cost"), data.get("CostPlus"))
+    description = _render_text(data.get("Text", ""), upgrade_syntax="square")
+    print("Found STS1 card {0}".format(name))
+    cards.append(Card(
+      name=name,
+      description=description,
+      card_type=card_type,
+      category=category,
+      rarity=rarity,
+      cost=cost,
+      game="STS1",
+    ))
   return cards
 
-def _sts2_parse_rsc_list(url):
-  """Parse a list page (relics/potions) from sts2.untapped.gg by extracting
-  React Server Component (RSC) data from self.__next_f.push() script blocks.
 
-  Returns list of (name, character, rarity, description) tuples.
-  """
-  resp = requests.get(url, timeout=15)
-  resp.raise_for_status()
-  text = resp.text
+def GatherRelics():
+  print("Gathering STS1 Relics")
+  relics = []
+  try:
+    wikitext = _get_module_wikitext("Module:Relics/data")
+  except Exception as e:
+    print("  Failed: {0}".format(e))
+    return relics
 
-  # Collect all RSC push payloads and unescape them
-  rsc_chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', text, re.DOTALL)
-  rsc_text = "\n".join(rsc_chunks)
-  rsc_text = rsc_text.replace('\\"', '"').replace('\\n', '\n')
+  for name, data in _parse_lua_table(wikitext).items():
+    description = _render_text(data.get("Description", ""), upgrade_syntax="none")
+    rarity = data.get("Rarity", "Common")
+    print("Found STS1 relic {0}".format(name))
+    relics.append(Relic(name, description, rarity, game="STS1"))
+  return relics
 
-  # Build a map of deferred ref IDs -> description text
-  ref_map = {}
-  desc_ref_pattern = re.compile(
-    r'([0-9a-f]+):\["\$","span",null,\{"className":"\$undefined","children":'
-    r'(\[\[.*?\]\])\}\]',
-    re.DOTALL
-  )
-  # Walk children in document order, splicing energy icon alt text inline.
-  # Consecutive energy icons get collapsed to "N Energy" (matches STS1 style).
-  token_pattern = re.compile(r'"children":"([^"]*)"|"alt":"([^"]*Energy)"')
-  for m in desc_ref_pattern.finditer(rsc_text):
-    ref_id = m.group(1)
-    children_str = m.group(2)
-    parts = []
-    for tok in token_pattern.finditer(children_str):
-      if tok.group(1) is not None:
-        parts.append(tok.group(1))
-      else:
-        parts.append('\x01E\x01')
-    text = "".join(parts)
-    # Number followed by energy icon(s): "4\x01E\x01" -> "4 Energy"
-    text = re.sub(r'(\d)\s*(\x01E\x01)+', lambda mm: mm.group(1) + ' Energy', text)
-    # Standalone energy icons: "\x01E\x01\x01E\x01" -> "2 Energy"
-    text = re.sub(r'(\x01E\x01)+',
-                  lambda mm: '{0} Energy'.format(mm.group(0).count('\x01E\x01')),
-                  text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    if text:
-      ref_map[ref_id] = _unescape_html(text)
 
-  # Find each item entry by its UPPER_CASE key. The wrapping component is
-  # rendered as a deferred ref ($L<hex>) rather than a literal "div", and the
-  # className suffix is __relic for relics or __potion for potions.
-  item_pattern = re.compile(
-    r'\["\$","\$L\w+","([A-Z][A-Z0-9_\'!? ]*)",\{"className":"[^"]*__(?:relic|potion)"'
-  )
+def GatherPotions():
+  print("Gathering STS1 Potions")
+  potions = []
+  try:
+    wikitext = _get_module_wikitext("Module:Potions/data")
+  except Exception as e:
+    print("  Failed: {0}".format(e))
+    return potions
 
-  items = []
-  seen_keys = set()
-  item_keys = [(m.group(1), m.start()) for m in item_pattern.finditer(rsc_text)]
+  for name, data in _parse_lua_table(wikitext).items():
+    raw = data.get("Text") or data.get("Description") or ""
+    description = _render_text(raw, upgrade_syntax="angle")
+    rarity = data.get("Rarity", "Common")
+    print("Found STS1 potion {0}".format(name))
+    potions.append(Potion(name, description, rarity, game="STS1"))
+  return potions
 
-  for idx, (key, start_pos) in enumerate(item_keys):
-    if key in seen_keys:
+
+def GatherEvents():
+  print("Gathering STS1 Events")
+  events = []
+  try:
+    wikitext = _get_module_wikitext("Module:Events/data")
+  except Exception as e:
+    print("  Failed: {0}".format(e))
+    return events
+
+  for name, data in _parse_lua_table(wikitext).items():
+    description = _render_text(data.get("Description", ""), upgrade_syntax="none")
+    description = re.sub(r"'{2,}", "", description)
+    act = data.get("Act") or "Unknown"
+    if isinstance(act, dict):
+      act = "Multiple"
+    print("Found STS1 event {0}".format(name))
+    events.append(Event(name, description, act, game="STS1"))
+  return events
+
+
+# =========================================================================
+# STS2 gathering
+# =========================================================================
+
+_STS2_CARD_MODULES = [
+  "Module:Cards/StS2 data/Ironclad",
+  "Module:Cards/StS2 data/Silent",
+  "Module:Cards/StS2 data/Defect",
+  "Module:Cards/StS2 data/Necrobinder",
+  "Module:Cards/StS2 data/Regent",
+  "Module:Cards/StS2 data/Colorless",
+]
+
+def GatherSTS2Cards():
+  print("\nGathering STS2 Cards")
+  cards = []
+  for module in _STS2_CARD_MODULES:
+    try:
+      wikitext = _get_module_wikitext(module)
+    except Exception as e:
+      print("  Failed to fetch {0}: {1}".format(module, e))
       continue
-    seen_keys.add(key)
 
-    end_pos = item_keys[idx + 1][1] if idx + 1 < len(item_keys) else start_pos + 2000
-    slice_text = rsc_text[start_pos:end_pos]
+    for name, data in _parse_lua_table(wikitext).items():
+      color = data.get("Color", "Colorless")
+      card_type = data.get("Type", "Skill")
+      rarity = data.get("Rarity", "Basic")
+      category = color
+      if card_type in ("Status", "Curse"):
+        category = card_type
+      cost = _format_cost(data.get("Cost"), data.get("CostPlus"))
+      star_cost = data.get("StarCost")
+      if star_cost is not None:
+        star_cost = str(star_cost)
+      description = _render_text(data.get("Text", ""), upgrade_syntax="square")
+      print("Found STS2 card {0}".format(name))
+      cards.append(Card(
+        name=name,
+        description=description,
+        card_type=card_type,
+        category=category,
+        rarity=rarity,
+        cost=cost,
+        game="STS2",
+        star_cost=star_cost,
+      ))
+    time.sleep(0.2)
+  return cards
 
-    # Relics use h3, potions use h2
-    h_match = re.search(r'\["\$","h[23]",null,\{"children":"([^"]+)"\}\]', slice_text)
-    if not h_match:
-      continue
-    item_name = _unescape_html(h_match.group(1))
-
-    detail_match = re.search(
-      r'"children":"\xb7"\}]'
-      r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]'
-      r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]',
-      slice_text, re.DOTALL
-    )
-    if not detail_match:
-      # Try with escaped middot
-      detail_match = re.search(
-        r'"children":"\\u00b7"\}]'
-        r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]'
-        r'.*?\["\$","span",null,\{"children":"([^"]+)"\}]',
-        slice_text, re.DOTALL
-      )
-    character = detail_match.group(1) if detail_match else "Colorless"
-    rarity = detail_match.group(2) if detail_match else "Unknown"
-
-    desc_ref_match = re.search(r'description","children":"\$L([0-9a-f]+)"', slice_text)
-    description = ""
-    if desc_ref_match:
-      ref_id = desc_ref_match.group(1)
-      description = ref_map.get(ref_id, "")
-
-    items.append((item_name, character, rarity, _unescape_html(description)))
-
-  return items
 
 def GatherSTS2Relics():
-  print("\nGathering STS2 Relics...")
-  items = _sts2_parse_rsc_list(STS2_BASE + "/en/relics")
+  print("\nGathering STS2 Relics")
   relics = []
-  seen_names = set()
-  for name, character, rarity, description in items:
-    if name in seen_names:
-      continue
-    seen_names.add(name)
-    category = character if character != "Colorless" else rarity
-    if category in ("Common", "Uncommon", "Rare", "Starter", "Boss", "Event",
-                     "Shop", "Ancient", "Basic", "Unknown"):
-      category = character
+  try:
+    wikitext = _get_module_wikitext("Module:Relics/StS2 data")
+  except Exception as e:
+    print("  Failed: {0}".format(e))
+    return relics
+
+  for name, data in _parse_lua_table(wikitext).items():
+    description = _render_text(data.get("Description", ""), upgrade_syntax="none")
+    category = data.get("Character") or data.get("Rarity") or "Common"
     print("Found STS2 relic {0}".format(name))
     relics.append(Relic(name, description, category, game="STS2"))
   return relics
 
+
 def GatherSTS2Potions():
-  print("\nGathering STS2 Potions...")
-  items = _sts2_parse_rsc_list(STS2_BASE + "/en/potions")
+  print("\nGathering STS2 Potions")
   potions = []
-  seen_names = set()
-  for name, character, rarity, description in items:
-    if name in seen_names:
-      continue
-    seen_names.add(name)
+  try:
+    wikitext = _get_module_wikitext("Module:Potions/StS2 data")
+  except Exception as e:
+    print("  Failed: {0}".format(e))
+    return potions
+
+  for name, data in _parse_lua_table(wikitext).items():
+    raw = data.get("Text") or data.get("Description") or ""
+    description = _render_text(raw, upgrade_syntax="none")
+    rarity = data.get("Rarity", "Common")
     print("Found STS2 potion {0}".format(name))
     potions.append(Potion(name, description, rarity, game="STS2"))
   return potions
+
+
+def GatherSTS2Events():
+  print("\nGathering STS2 Events")
+  events = []
+  try:
+    wikitext = _get_module_wikitext("Module:Events/StS2 data")
+  except Exception as e:
+    print("  Failed: {0}".format(e))
+    return events
+
+  for name, data in _parse_lua_table(wikitext).items():
+    description = _render_text(data.get("Description", ""), upgrade_syntax="none")
+    description = re.sub(r"'{2,}", "", description)
+    act_field = data.get("Act") or "Unknown"
+    if isinstance(act_field, dict) and "__raw__" in act_field:
+      raw = act_field["__raw__"]
+      parts = re.findall(r'"([^"]*)"', raw)
+      act = ", ".join(parts) if parts else "Unknown"
+    elif isinstance(act_field, dict):
+      act = "Unknown"
+    else:
+      act = act_field
+    print("Found STS2 event {0}".format(name))
+    events.append(Event(name, description, act, game="STS2"))
+  return events
 
 
 # =========================================================================
@@ -788,24 +818,24 @@ def GatherSTS2Potions():
 # =========================================================================
 
 def main():
-  # STS1 (via MediaWiki API)
   cards = GatherCards()
   relics = GatherRelics()
   potions = GatherPotions()
   events = GatherEvents()
 
-  # STS2
   sts2_cards = GatherSTS2Cards()
   sts2_relics = GatherSTS2Relics()
   sts2_potions = GatherSTS2Potions()
+  sts2_events = GatherSTS2Events()
 
-  all_items = cards + relics + potions + events + sts2_cards + sts2_relics + sts2_potions
+  all_items = (cards + relics + potions + events
+               + sts2_cards + sts2_relics + sts2_potions + sts2_events)
 
   print("\n=== Summary ===")
   print("STS1: {0} cards, {1} relics, {2} potions, {3} events".format(
     len(cards), len(relics), len(potions), len(events)))
-  print("STS2: {0} cards, {1} relics, {2} potions".format(
-    len(sts2_cards), len(sts2_relics), len(sts2_potions)))
+  print("STS2: {0} cards, {1} relics, {2} potions, {3} events".format(
+    len(sts2_cards), len(sts2_relics), len(sts2_potions), len(sts2_events)))
   print("Total: {0} items".format(len(all_items)))
 
   open(os.path.join(os.path.dirname(__file__), "data.yml"), "w").write(

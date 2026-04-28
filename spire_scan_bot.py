@@ -27,15 +27,13 @@ word_finder = re.compile(r"\[\[.+?\]\]")
 
 # --- URL helpers ---
 
-STS1_WIKI = "http://slay-the-spire.wikia.com/wiki"
-STS2_WIKI = "https://sts2.untapped.gg/en"
+STS_WIKI = "https://slaythespire.wiki.gg/wiki"
 
 def wiki_url(title, game="STS1"):
   if game == "STS2":
-    slug = re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_')
-    return "{0}/cards/{1}".format(STS2_WIKI, slug)
-  # STS1 and BOTH both link to the STS1 wiki
-  return "{0}/{1}".format(STS1_WIKI, url_encode(title))
+    return "{0}/Slay_the_Spire_2:{1}".format(STS_WIKI, url_encode(title))
+  # STS1 and BOTH both link to the unprefixed (STS1) namespace on the wiki
+  return "{0}/{1}".format(STS_WIKI, url_encode(title))
 
 def escape(string):
   return re.sub(r"\W", "", string.replace("(BETA)", "").lower())
