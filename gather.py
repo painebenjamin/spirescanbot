@@ -2,18 +2,19 @@
 # -*- coding: utf-8 -*-
 """Gather Slay the Spire 1 & 2 data from slaythespire.wiki.gg.
 
-Both games' content is stored as Lua return-table modules accessible through
+Both games' content is stored as Lua table modules accessible through
 MediaWiki's parse API. We fetch the wikitext for each module, parse the table,
 and render each entry's text into the upgrade-diff display style used by the
 Reddit bot (e.g. "Deal 6(9) damage.").
 """
-import requests
+import html as html_module
 import os
 import re
 import time
-import yaml
-import html as html_module
 from difflib import SequenceMatcher
+
+import requests
+import yaml
 
 WIKI_API = "https://slaythespire.wiki.gg/api.php"
 
@@ -69,74 +70,59 @@ class Event(SpireObject):
 # MediaWiki fetch
 # =========================================================================
 
-_HEADERS = {"User-Agent": "SpireScanBot/2.0 (+https://github.com/ehmohteeoh/spirescanbot)"}
+_HEADERS = {"User-Agent": "SpireScanBot/2.1 (+https://github.com/ehmohteeoh/spirescanbot)"}
+
 
 def _get_module_wikitext(page, max_retries=3):
   """Fetch the raw wikitext for a Module: page via the MediaWiki parse API."""
   delay = 1.0
-  for attempt in range(max_retries):
+  last_resp = None
+  for _attempt in range(max_retries):
     resp = requests.get(WIKI_API, params={
       "action": "parse",
       "page": page,
       "prop": "wikitext",
       "format": "json",
     }, headers=_HEADERS, timeout=20)
+    last_resp = resp
     if resp.status_code == 429:
       time.sleep(delay)
       delay *= 2
       continue
     resp.raise_for_status()
+    payload = resp.json()
+    if "error" in payload:
+      raise RuntimeError(payload["error"].get("info", payload["error"]))
     time.sleep(0.3)
-    return resp.json()["parse"]["wikitext"]["*"]
-  resp.raise_for_status()
-  return resp.json()["parse"]["wikitext"]["*"]
+    return payload["parse"]["wikitext"]["*"]
+
+  last_resp.raise_for_status()
+  payload = last_resp.json()
+  return payload["parse"]["wikitext"]["*"]
 
 
 # =========================================================================
-# Lua return-table parser
+# Lua data-table parser
 # =========================================================================
 
 _LUA_STRING_ESCAPES = {
   "n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'", "\\": "\\",
 }
 
-def _strip_lua_comments(text):
-  """Remove Lua line comments (-- ...) but only outside string literals."""
-  out = []
-  i = 0
-  n = len(text)
-  while i < n:
-    ch = text[i]
-    if ch == '"':
-      j = i + 1
-      while j < n and text[j] != '"':
-        if text[j] == '\\' and j + 1 < n:
-          j += 2
-        else:
-          j += 1
-      out.append(text[i:j + 1])
-      i = j + 1
-    elif ch == '-' and i + 1 < n and text[i + 1] == '-':
-      while i < n and text[i] != '\n':
-        i += 1
-    else:
-      out.append(ch)
-      i += 1
-  return "".join(out)
-
 
 def _read_lua_string(text, i):
-  """Read a Lua double-quoted string starting at text[i] == '"'.
+  """Read a Lua single- or double-quoted string at text[i].
 
   Returns (decoded_value, index_after_closing_quote).
   """
-  assert text[i] == '"'
+  quote = text[i]
+  assert quote in ('"', "'")
   i += 1
   out = []
   n = len(text)
   while i < n:
     ch = text[i]
-    if ch == '"':
+    if ch == quote:
       return "".join(out), i + 1
     if ch == '\\' and i + 1 < n:
       nxt = text[i + 1]
@@ -153,19 +139,97 @@ def _read_lua_string(text, i):
             continue
           except ValueError:
             pass
+      # Lua accepts many escapes; for our display purposes, keep the escaped char.
       out.append(nxt)
       i += 2
-    else:
-      out.append(ch)
-      i += 1
+      continue
+    out.append(ch)
+    i += 1
   return "".join(out), i
+
+
+def _skip_lua_string(text, i):
+  """Return the first index after a Lua quoted string starting at i."""
+  _value, j = _read_lua_string(text, i)
+  return j
+
+
+def _strip_lua_comments(text):
+  """Remove Lua line comments (-- ...) but only outside string literals."""
+  out = []
+  i = 0
+  n = len(text)
+  while i < n:
+    ch = text[i]
+    if ch in ('"', "'"):
+      j = _skip_lua_string(text, i)
+      out.append(text[i:j])
+      i = j
+      continue
+    if ch == '-' and i + 1 < n and text[i + 1] == '-':
+      # Skip a line comment. The data modules do not use Lua long comments.
+      while i < n and text[i] != '\n':
+        i += 1
+      continue
+    out.append(ch)
+    i += 1
+  return "".join(out)
+
+
+def _extract_lua_braced_body(text, open_brace_index):
+  """Return the body inside a Lua `{ ... }` table literal.
+
+  `open_brace_index` must point at the opening `{`. Strings are skipped so
+  braces that appear in card/relic text do not affect the brace depth.
+  Returns None if the table is unterminated.
+  """
+  assert text[open_brace_index] == '{'
+  depth = 1
+  i = open_brace_index + 1
+  n = len(text)
+  while i < n and depth > 0:
+    ch = text[i]
+    if ch in ('"', "'"):
+      i = _skip_lua_string(text, i)
+      continue
+    if ch == '{':
+      depth += 1
+    elif ch == '}':
+      depth -= 1
+      if depth == 0:
+        return text[open_brace_index + 1:i]
+    i += 1
+  return None
+
+
+def _extract_lua_top_level_table_body(text):
+  """Find the data table body in a wiki module.
+
+  Older modules were a direct `return { ... }`. Many wiki.gg modules now build
+  `local all_data = { ... }`, copy it into a `formatted` table, and then
+  `return formatted`. In both cases the real top-level entries are in the same
+  Lua table shape, so support both layouts.
+  """
+  patterns = (
+    r'\breturn\s*\{',
+    r'\blocal\s+all_data\s*=\s*\{',
+    r'\ball_data\s*=\s*\{',
+  )
+  for pattern in patterns:
+    m = re.search(pattern, text)
+    if not m:
+      continue
+    body = _extract_lua_braced_body(text, m.end() - 1)
+    if body is not None:
+      return body
+  return None
 
 
 def _read_lua_value(text, i):
   """Read a Lua value (string, number, bool, nil, or { ... }) at text[i].
 
-  Returns (value, index_after_value). For tables we capture the raw inner
-  text, since we never need to deeply traverse Traits/Requirement/etc.
+  Returns (value, index_after_value). For nested tables we capture the raw
+  inner text, since we only need to inspect a handful of simple fields.
   """
   n = len(text)
   while i < n and text[i] in " \t\r\n":
@@ -174,23 +238,13 @@ def _read_lua_value(text, i):
     return None, i
 
   ch = text[i]
-  if ch == '"':
+  if ch in ('"', "'"):
     return _read_lua_string(text, i)
   if ch == '{':
-    depth = 1
-    j = i + 1
-    while j < n and depth > 0:
-      cj = text[j]
-      if cj == '"':
-        _, j = _read_lua_string(text, j)
-        continue
-      if cj == '{':
-        depth += 1
-      elif cj == '}':
-        depth -= 1
-      j += 1
-    inner = text[i + 1:j - 1]
-    return {"__raw__": inner}, j
+    body = _extract_lua_braced_body(text, i)
+    if body is None:
+      return {"__raw__": text[i + 1:]}, n
+    return {"__raw__": body}, i + len(body) + 2
   m = re.match(r'(-?\d+(?:\.\d+)?)', text[i:])
   if m:
     raw = m.group(1)
@@ -202,8 +256,7 @@ def _read_lua_value(text, i):
   m = re.match(r'(true|false|nil)\b', text[i:])
   if m:
     raw = m.group(1)
-    val = {"true": True, "false": False, "nil": None}[raw]
-    return val, i + len(raw)
+    return {"true": True, "false": False, "nil": None}[raw], i + len(raw)
   return None, i + 1
 
 
@@ -223,7 +276,7 @@ def _parse_lua_object_body(body):
       if end == -1:
         break
       key_expr = body[i + 1:end].strip()
-      if key_expr.startswith('"') and key_expr.endswith('"'):
+      if key_expr and key_expr[0] in ('"', "'"):
         key, _ = _read_lua_string(key_expr, 0)
       else:
         key = key_expr
@@ -248,40 +301,23 @@ def _parse_lua_object_body(body):
 
 
 def _parse_lua_table(text):
-  """Parse a Lua return-table module into a dict of {name: {field: value}}.
+  """Parse a Lua data-table module into a dict of {name: {field: value}}.
 
   Top-level entries are expected to be of the form `["Name"] = { ... }`.
   Returns an ordered dict-like list-preserving dict.
   """
   text = _strip_lua_comments(text)
-  m = re.search(r'\breturn\s*\{', text)
-  if not m:
+  body = _extract_lua_top_level_table_body(text)
+  if body is None:
     return {}
-  start = m.end()
-  depth = 1
-  i = start
-  n = len(text)
-  while i < n and depth > 0:
-    ch = text[i]
-    if ch == '"':
-      _, i = _read_lua_string(text, i)
-      continue
-    if ch == '{':
-      depth += 1
-    elif ch == '}':
-      depth -= 1
-      if depth == 0:
-        break
-    i += 1
-  body = text[start:i]
 
   entries = {}
   j = 0
-  m_len = len(body)
-  while j < m_len:
-    while j < m_len and body[j] in " \t\r\n,;":
+  n = len(body)
+  while j < n:
+    while j < n and body[j] in " \t\r\n,;":
       j += 1
-    if j >= m_len:
+    if j >= n:
       break
     if body[j] != '[':
       j += 1
@@ -290,14 +326,14 @@ def _parse_lua_table(text):
     if end == -1:
       break
     key_expr = body[j + 1:end].strip()
-    if key_expr.startswith('"'):
+    if key_expr and key_expr[0] in ('"', "'"):
       key, _ = _read_lua_string(key_expr, 0)
     else:
       key = key_expr
     k = end + 1
-    while k < m_len and body[k] in " \t\r\n":
+    while k < n and body[k] in " \t\r\n":
       k += 1
-    if k >= m_len or body[k] != '=':
+    if k >= n or body[k] != '=':
       j = end + 1
       continue
     k += 1
@@ -315,17 +351,23 @@ def _parse_lua_table(text):
 # Wiki text -> display text rendering
 # =========================================================================
 
+_WIKILINK_RE = re.compile(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
+
+
+def _strip_wikilinks(text):
+  """Replace [[Page|Display]] -> Display, [[Page]] -> Page."""
+  return _WIKILINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+
+
 def _strip_templates(text):
   """Replace MediaWiki templates with reasonable display text.
 
-  - {{C|X}} / {{C|X|Y}} / {{C|X|Y|2}} -> last non-empty (and non-numeric) arg
-  - {{R|Name||2}}                     -> Name
-  - {{KW|kw|Display|2}}               -> Display (or kw if no display)
-  - {{QueryLink|page|filter|Display}} -> Display
-  - any other {{...}}                 -> stripped
+  - {{C|X}} / {{R|X}} / {{P|X}} / {{KW|kw|Display}} -> readable arg
+  - {{QueryLink|page|filter|Display}}                -> Display
+  - {{2|Page|Display}}                               -> Display/Page
+  - any other {{...}}                                -> stripped
   """
   def _resolve(args):
-    """Return the most readable arg from a template's pipe-split args."""
     cleaned = [a.strip() for a in args]
     while cleaned and (not cleaned[-1] or cleaned[-1].isdigit()):
       cleaned.pop()
@@ -336,13 +378,13 @@ def _strip_templates(text):
     parts = inner.split('|')
     name = parts[0].strip()
     args = parts[1:]
-    if name in ("C", "R", "KW"):
+    if name in ("C", "R", "P", "KW", "2"):
       return _resolve(args) or name
     if name == "QueryLink":
       return _resolve(args)
     return ""
 
-  for _ in range(5):
+  for _ in range(8):
     new_text = re.sub(r'\{\{([^{}]*)\}\}', _replace, text)
     if new_text == text:
       break
@@ -351,72 +393,57 @@ def _strip_templates(text):
 
 
 def _replace_keyword_dollar(text):
-  """Replace $Keyword references with plain text.
-
-  Keywords are TitleCase words, optionally a second TitleCase word
-  (e.g. $Lock On, $Plated Armor).
-  """
+  """Replace $Keyword references with plain text."""
   return re.sub(
-    r'\$([A-Z][A-Za-z]*)((?:\s+[A-Z][A-Za-z]*)?)',
-    lambda m: m.group(1) + m.group(2),
+    r'\$([A-Z][A-Za-z]*(?:\s+[A-Z][A-Za-z]*)?)',
+    lambda m: m.group(1),
     text,
   )
 
 
 # All character/colorless energy icon codes used across both games.
-_ENERGY_TOKEN_RE = re.compile(
-  r'@(RE|GE|BE|PE|IE|SE|DE|NE|CE|RegE)'
-)
+_ENERGY_TOKEN_RE = re.compile(r'@(RE|GE|BE|PE|IE|SE|DE|NE|CE|RegE)')
 _STAR_TOKEN_RE = re.compile(r'@ST')
 
 
 def _collapse_energy_and_stars(text):
-  """Convert sequences of energy/star icons into "N Energy" / "N Stars".
-
-  Examples:
-    "Gain @RE @RE."          -> "Gain 2 Energy."
-    "Costs 1 less @BE for"   -> "Costs 1 less Energy for"   (single = 1 Energy collapsed)
-    "Gain @ST@ST@ST."        -> "Gain 3 Stars."
-  """
+  """Convert sequences of energy/star icons into "N Energy" / "N Stars"."""
   marker_e = '\x01E\x01'
   marker_s = '\x01S\x01'
   text = _ENERGY_TOKEN_RE.sub(marker_e, text)
   text = _STAR_TOKEN_RE.sub(marker_s, text)
 
-  def _repl_numbered_energy(m):
-    return m.group(1) + ' Energy'
-  text = re.sub(r'(\d)\s*' + marker_e + r'(?:\s*' + marker_e + r')*',
-                _repl_numbered_energy, text)
+  text = re.sub(
+    r'(\d)\s*' + marker_e + r'(?:\s*' + marker_e + r')*',
+    lambda m: m.group(1) + ' Energy',
+    text,
+  )
+  text = re.sub(
+    marker_e + r'(?:\s*' + marker_e + r')*',
+    lambda m: 'Energy' if m.group(0).count(marker_e) == 1
+    else '{0} Energy'.format(m.group(0).count(marker_e)),
+    text,
+  )
 
-  def _repl_energy(m):
-    n = m.group(0).count(marker_e)
-    return ('Energy' if n == 1 else '{0} Energy'.format(n))
-  text = re.sub(marker_e + r'(?:\s*' + marker_e + r')*', _repl_energy, text)
-
-  def _repl_numbered_stars(m):
-    return m.group(1) + ' Stars'
-  text = re.sub(r'(\d)\s*' + marker_s + r'(?:\s*' + marker_s + r')*',
-                _repl_numbered_stars, text)
-
-  def _repl_stars(m):
-    n = m.group(0).count(marker_s)
-    return ('1 Star' if n == 1 else '{0} Stars'.format(n))
-  text = re.sub(marker_s + r'(?:\s*' + marker_s + r')*', _repl_stars, text)
+  text = re.sub(
+    r'(\d)\s*' + marker_s + r'(?:\s*' + marker_s + r')*',
+    lambda m: m.group(1) + ' Stars',
+    text,
+  )
+  text = re.sub(
+    marker_s + r'(?:\s*' + marker_s + r')*',
+    lambda m: '1 Star' if m.group(0).count(marker_s) == 1
+    else '{0} Stars'.format(m.group(0).count(marker_s)),
+    text,
+  )
 
   # Remaining @-prefixed icon tokens (e.g. @Gold) -> the bare word.
   text = re.sub(r'@([A-Z][A-Za-z]*)', r'\1', text)
-
   return text
 
 
 def _expand_upgrade_brackets(text, opener, closer, separator):
-  """Expand inline upgrade brackets into base/upgrade text pairs.
-
-  STS1 cards / STS2 cards use [base|upgrade].
-  STS1 potions use <base:upgrade>.
-
-  We walk left-to-right collecting two parallel strings (base, upgraded).
-  """
+  """Expand inline upgrade brackets into base/upgrade text pairs."""
   base = []
   upg = []
   i = 0
@@ -438,9 +465,6 @@ def _expand_upgrade_brackets(text, opener, closer, separator):
       else:
         b = inside[:sep_pos]
         u = inside[sep_pos + 1:]
-        # When one side is empty, add a separating space so it doesn't
-        # collide with adjacent words from outside the bracket
-        # (e.g. "add<:two copies>" should expand to "add" / "add two copies").
         if not b and u:
           u = ' ' + u
         if not u and b:
@@ -462,13 +486,6 @@ def _normalize_whitespace(text):
   text = re.sub(r'\s+([.,;:!?])', r'\1', text)
   text = re.sub(r'\s+', ' ', text)
   return text.strip()
-
-
-_WIKILINK_RE = re.compile(r'\[\[([^\]|]+)(?:\|([^\]]+))?\]\]')
-
-def _strip_wikilinks(text):
-  """Replace [[Page|Display]] -> Display, [[Page]] -> Page."""
-  return _WIKILINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
 
 
 def _render_text(raw, upgrade_syntax="square"):
@@ -534,11 +551,9 @@ def _compute_upgrade_diff(base_text, upgrade_text):
           ' '.join(base_chunk), ' '.join(upg_chunk)
         ))
     elif op == 'insert':
-      added = ' '.join(upg_words[j1:j2])
-      result.append('({0})'.format(added))
+      result.append('({0})'.format(' '.join(upg_words[j1:j2])))
     elif op == 'delete':
-      removed = ' '.join(base_words[i1:i2])
-      result.append(removed)
+      result.append(' '.join(base_words[i1:i2]))
 
   return ' '.join(result)
 
@@ -556,13 +571,10 @@ def _diff_word(base_word, upg_word):
 
   if base_stripped == upg_stripped:
     return base_word
-
   if _is_number(base_stripped) and _is_number(upg_stripped):
     return '{0}({1}){2}'.format(base_stripped, upg_stripped, punct)
-
   if upg_stripped == base_stripped + 's' or upg_stripped == base_stripped + 'es':
     return base_stripped + '(s)' + punct
-
   return '{0}({1}){2}'.format(base_stripped, upg_stripped, punct)
 
 
@@ -579,12 +591,7 @@ def _is_number(s):
 # =========================================================================
 
 def _format_cost(cost, cost_plus=None):
-  """Return display string for a cost, or None for unplayable.
-
-  Cost == -2 -> Unplayable (None)
-  Cost == -1 -> X
-  Otherwise int. CostPlus, if different, is rendered as "a(b)".
-  """
+  """Return display string for a cost, or None for unplayable."""
   if cost is None or cost == -2:
     return None
   if cost == -1:
@@ -603,7 +610,7 @@ def _format_cost(cost, cost_plus=None):
 
 
 # =========================================================================
-# STS1 gathering (Module:Cards/data, Module:Relics/data, etc.)
+# STS1 gathering
 # =========================================================================
 
 _STS1_COLOR_TO_CATEGORY = {
@@ -613,6 +620,7 @@ _STS1_COLOR_TO_CATEGORY = {
   "Purple": "Watcher",
   "Colorless": "Colorless",
 }
+
 
 def GatherCards():
   print("Gathering STS1 Cards")
@@ -715,6 +723,7 @@ _STS2_CARD_MODULES = [
   "Module:Cards/StS2 data/Colorless",
 ]
 
+
 def GatherSTS2Cards():
   print("\nGathering STS2 Cards")
   cards = []
@@ -726,12 +735,10 @@ def GatherSTS2Cards():
       continue
 
     for name, data in _parse_lua_table(wikitext).items():
-      color = data.get("Color", "Colorless")
       card_type = data.get("Type", "Skill")
+      color = data.get("Color", "Colorless")
       rarity = data.get("Rarity", "Basic")
-      category = color
-      if card_type in ("Status", "Curse"):
-        category = card_type
+      category = card_type if card_type in ("Status", "Curse") else color
       cost = _format_cost(data.get("Cost"), data.get("CostPlus"))
       star_cost = data.get("StarCost")
       if star_cost is not None:
@@ -801,8 +808,7 @@ def GatherSTS2Events():
     description = re.sub(r"'{2,}", "", description)
     act_field = data.get("Act") or "Unknown"
     if isinstance(act_field, dict) and "__raw__" in act_field:
-      raw = act_field["__raw__"]
-      parts = re.findall(r'"([^"]*)"', raw)
+      parts = re.findall(r'"([^"]*)"', act_field["__raw__"])
       act = ", ".join(parts) if parts else "Unknown"
     elif isinstance(act_field, dict):
       act = "Unknown"
